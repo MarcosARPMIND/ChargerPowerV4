@@ -1,0 +1,29 @@
+# Build output
+build/
+mx.scratch
+
+# Compiled/linked artifacts (in case anything builds outside build/)
+*.o
+*.obj
+*.elf
+*.map
+*.bin
+*.hex
+*.list
+*.su
+
+# CMake (stray in-source configure)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Debug logs
+gdbClient_log.txt
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+!.settings

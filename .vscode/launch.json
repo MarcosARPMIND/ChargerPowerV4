@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "stlinkgdbtarget",
+            "request": "launch",
+            "name": "STM32Cube: Flash + Debug (Debug)",
+            "cwd": "${workspaceFolder}",
+            "deviceName": "STM32C031C6T7",
+            "deviceCore": "Cortex-M0+",
+            "runEntry": "main",
+            "imagesAndSymbols": [
+                {
+                    "imageFileName": "${workspaceFolder}/build/Debug/ChargerPowerV4.elf"
+                }
+            ]
+        }
+    ]
+}
