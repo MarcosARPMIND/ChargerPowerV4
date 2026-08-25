@@ -21,6 +21,7 @@
 #include "main.h"
 #include "adc.h"
 #include "dma.h"
+#include "i2c.h"
 #include "iwdg.h"
 #include "spi.h"
 #include "tim.h"
@@ -121,6 +122,7 @@ int main(void)
   MX_TIM14_Init();
   MX_TIM17_Init();
   MX_IWDG_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);

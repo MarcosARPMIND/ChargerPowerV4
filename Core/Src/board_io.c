@@ -201,11 +201,3 @@ bool Board_Is_K3_Closed(void){
 bool Board_Is_K4_Closed(void){
 	return (HAL_GPIO_ReadPin(RELAY_STATE_4_PORT,RELAY_STATE_4_PIN) == GPIO_PIN_SET);
 }
-
-/**
- * @brief  Controls the RCD (Residual Current Device) Test Output.
- * @param  state true to TRIGGER test (create fault), false to idle.
- */
-void Board_SetRCD(bool state){
-	HAL_GPIO_WritePin(RCD_TEST_PORT,RCD_TEST_PIN, state);
-}

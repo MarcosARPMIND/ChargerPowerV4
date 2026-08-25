@@ -59,6 +59,20 @@ extern volatile uint8_t RCD_Fault;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define general_LED_Pin GPIO_PIN_2
+#define general_LED_GPIO_Port GPIOB
+#define cable_lock_Pin GPIO_PIN_10
+#define cable_lock_GPIO_Port GPIOB
+#define button_2_ext_Pin GPIO_PIN_11
+#define button_2_ext_GPIO_Port GPIOB
+#define button_1_ext_Pin GPIO_PIN_15
+#define button_1_ext_GPIO_Port GPIOB
+#define h_bridge_1_Pin GPIO_PIN_6
+#define h_bridge_1_GPIO_Port GPIOC
+#define h_bridge_2_Pin GPIO_PIN_12
+#define h_bridge_2_GPIO_Port GPIOA
+#define os_temp_Pin GPIO_PIN_1
+#define os_temp_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 

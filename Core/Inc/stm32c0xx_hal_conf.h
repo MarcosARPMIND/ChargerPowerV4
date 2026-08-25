@@ -38,7 +38,7 @@ extern "C" {
 #define HAL_ADC_MODULE_ENABLED
 /* #define HAL_CRC_MODULE_ENABLED   */
 /* #define HAL_CRYP_MODULE_ENABLED   */
-/* #define HAL_I2C_MODULE_ENABLED   */
+#define HAL_I2C_MODULE_ENABLED
 /* #define HAL_I2S_MODULE_ENABLED   */
 #define HAL_IWDG_MODULE_ENABLED
 /* #define HAL_IRDA_MODULE_ENABLED   */
@@ -270,5 +270,3 @@ void assert_failed(uint8_t *file, uint32_t line);
 #endif
 
 #endif /* STM32C0xx_HAL_CONF_H */
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

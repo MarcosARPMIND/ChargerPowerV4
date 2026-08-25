@@ -80,6 +80,14 @@
 #define UART1_TX_PORT               GPIOA
 #define UART1_TX_PIN                GPIO_PIN_9
 
+/* --- I2C1 (Temperature Sensor) --- */
+/* Note: I2C pins are configured via CubeMX (.ioc). Defined here for context only. */
+#define I2C1_SCL_PORT               GPIOA
+#define I2C1_SCL_PIN                GPIO_PIN_9
+
+#define I2C1_SDA_PORT               GPIOA
+#define I2C1_SDA_PIN                GPIO_PIN_10
+
 
 /* ============================================================================== */
 /* SENSORS & MEASUREMENT                              */
@@ -90,11 +98,16 @@
 #define RCD_ERROR_PIN               GPIO_PIN_13     /* Input: Fault signal from RCD module */
 #define RCD_DEBOUNCE_MS             1              /* Software debounce window (ms) */
 
-#define RCD_TEST_PORT               GPIOD
-#define RCD_TEST_PIN                GPIO_PIN_1      /* Output: Triggers RCD self-test */
-
 #define ADE_EXTI_PORT               GPIOA           /* Input: Interrupt Request (IRQ) */
 #define ADE_EXTI_PIN                GPIO_PIN_1      /* Configured via NVIC in CubeMX */
+
+/* --- Temperature Sensor (I2C, over I2C1_SCL/SDA above) --- */
+#define TEMP_SENSOR_ALERT_PORT      GPIOD
+#define TEMP_SENSOR_ALERT_PIN       GPIO_PIN_1      /* Input: alert/interrupt line from the I2C temperature sensor */
+
+/* --- Proximity Pilot (PP) Sense --- */
+#define PP_SENSE_PORT               GPIOA
+#define PP_SENSE_PIN                GPIO_PIN_11     /* Input: ADC1_IN11 — measures PP-to-PE resistance (cable current rating) */
 
 
 /* ============================================================================== */
@@ -124,6 +137,39 @@
 #define RELAY_STATE_4_PIN           GPIO_PIN_0      /* Feedback from K4 (Neutral) */
 
 
+/* ============================================================================== */
+/* CABLE LOCK ACTUATOR                              */
+/* ============================================================================== */
+
+/* --- H-Bridge Driver (Outputs) --- */
+/* Drives the connector lock motor; the combination of both pins sets direction (lock/unlock) */
+#define LOCK_HBRIDGE_1_PORT         GPIOC
+#define LOCK_HBRIDGE_1_PIN          GPIO_PIN_6
+
+#define LOCK_HBRIDGE_2_PORT         GPIOA
+#define LOCK_HBRIDGE_2_PIN          GPIO_PIN_12     /* Shares silicon pad with PA10 on this package, see .ioc */
+
+/* --- Lock Feedback (Input) --- */
+#define CABLE_LOCK_STATE_PORT       GPIOB
+#define CABLE_LOCK_STATE_PIN        GPIO_PIN_10     /* Input: set when the connector lock is engaged */
+
+
+/* ============================================================================== */
+/* USER INTERFACE                                   */
+/* ============================================================================== */
+
+/* --- External Buttons (Inputs) --- */
+/* Reserved for future emergency-stop buttons */
+#define BUTTON_1_EXT_PORT           GPIOB
+#define BUTTON_1_EXT_PIN            GPIO_PIN_15
+
+#define BUTTON_2_EXT_PORT           GPIOB
+#define BUTTON_2_EXT_PIN            GPIO_PIN_11
+
+/* --- General Purpose LED (Output) --- */
+/* Usage not yet defined (status indicator TBD) */
+#define GENERAL_LED_PORT            GPIOB
+#define GENERAL_LED_PIN             GPIO_PIN_2
 
 
 

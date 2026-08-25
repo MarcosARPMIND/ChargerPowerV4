@@ -41,9 +41,5 @@ bool Board_Is_K2_Closed(void);
 bool Board_Is_K3_Closed(void);
 bool Board_Is_K4_Closed(void);
 
-void Board_SetRCD(bool state);
-
-
-
 
 #endif /* INC_BOARD_IO_H_ */
