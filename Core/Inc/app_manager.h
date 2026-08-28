@@ -11,6 +11,7 @@
 #include "cp.h"
 #include "board_io.h"
 #include "energy_meter.h"
+#include "feature_config.h"
 #include "stm32c0xx_hal.h"
 #include <stdbool.h>
 #include <string.h>
@@ -80,7 +81,7 @@
 // --- Active Fault Bitmask (uint8_t active_faults) ---
 //
 //   Bit 7     Bit 6   Bit 5   Bit 4    Bit 3    Bit 2     Bit 1     Bit 0
-//  [RSVD]   [COMM] [CP_ERR][RELAY] [UNDERVOLT][OVERVOLT][OVERCURR][ RCD ]
+//  [CABLE]   [COMM] [CP_ERR][RELAY] [UNDERVOLT][OVERVOLT][OVERCURR][ RCD ]
 //
 //  Multiple faults can be active simultaneously.
 //  Example: RCD + Overcurrent → active_faults = 0b 0000 0011 = 0x03
@@ -92,7 +93,7 @@
 #define FAULT_BIT_RELAY      (1U << 4)  /* Bit 4: Relay error (see relay_errors for detail) */
 #define FAULT_BIT_CP_ERROR   (1U << 5)  /* Bit 5: Control Pilot signal error */
 #define FAULT_BIT_COMM       (1U << 6)  /* Bit 6: Communication timeout */
-//                           (1U << 7)  /* Bit 7: Reserved for future use */
+#define FAULT_BIT_CABLE      (1U << 7)  /* Bit 7: PP cable coding resistor invalid/unreadable */
 
 
 #define DATA_RS485			10	  // Maximum data lenght for transmisson
@@ -109,8 +110,7 @@
 /* Overcurrent Limit (milliamps) — matches CURRENT_LIMIT_HIGH with margin */
 #define OVERCURRENT_THRESH_mA     35000    /* 35A — above 33A hard limit */
 
-/* System Configuration */
-#define SYSTEM_PHASES             1        /* Set to 1 for Single-Phase, 3 for Three-Phase */
+/* SYSTEM_PHASES now lives in feature_config.h, included above */
 
 /* ============================================================================== */
 /* RELAY FEEDBACK VERIFICATION                                                    */
@@ -156,6 +156,15 @@
 #define STATE_NOTIFY_TIMEOUT_MS 5000
 #define STATE_NOTIFY_MAX_RETRIES 3
 
+/* ============================================================================== */
+/* STATUS LED                                                                     */
+/* ============================================================================== */
+
+/** Full on+off blink period (ms) while CHARGING */
+#define LED_PERIOD_CHARGING_MS   2000
+/** Full on+off blink period (ms) while in any FAULT_* state */
+#define LED_PERIOD_FAULT_MS       700
+
 
 
 
@@ -170,7 +179,8 @@ typedef enum{
 	FAULT_RELAY_CONTACT,
 	FAULT_GRID,
 	FAULT_CAR,
-	FAULT_CP_SHORT     /* State E: CP short to PE (0V) — IEC 61851 Table A.5 */
+	FAULT_CP_SHORT,    /* State E: CP short to PE (0V) — IEC 61851 Table A.5 */
+	FAULT_CABLE        /* PP coding resistor unreadable/out of range on cable connect */
 
 }STATE_MACHINE;
 

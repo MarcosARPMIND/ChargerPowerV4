@@ -22,6 +22,7 @@
 #include "tim.h"
 #include "adc.h"
 #include "dma.h"
+#include "app_config.h"
 #include <stdbool.h>
 
 /* ============================================================================== */
@@ -148,5 +149,64 @@ void CP_SetLine_High(void);
  * Used for Error handling or Reset.
  */
 void CP_SetLine_Low(void);
+
+#if ENABLE_PP_SENSE
+
+/**
+ * @brief  Reads the Proximity Pilot (PP) line voltage (PA11 / ADC1_IN11).
+ * Used to infer the PP-to-PE resistance (cable current rating coding).
+ * @note   Briefly repurposes ADC1 for one polled conversion, then restores
+ *         the continuous Control Pilot DMA scan on Channel 0. Call only
+ *         occasionally (not from a tight loop) -- not meant for streaming.
+ * @return PP line voltage in millivolts (0-3300).
+ */
+uint16_t PP_Read_mV(void);
+
+/* ============================================================================== */
+/* PROXIMITY PILOT (PP) RESISTANCE CODING (IEC 62196-1)                          */
+/* ============================================================================== */
+
+/**
+ * @defgroup PP_Voltage_Coding Theoretical PP line voltage per coding resistor (mV)
+ * Measured at PA11 through this board's PP sense divider.
+ * @{
+ */
+#define PP_V_1500_OHM_mV        2513u   /**< 1500 ohm -> 13A */
+#define PP_V_680_OHM_mV         1951u   /**< 680 ohm  -> 20A */
+#define PP_V_220_OHM_mV         1052u   /**< 220 ohm  -> 32A */
+#define PP_V_100_OHM_mV          578u   /**< 100 ohm  -> 63A three-phase (70A single-phase not handled) */
+/** @} */
+
+#define PP_V_TOLERANCE_mV        150u   /**< +/- hysteresis window around each nominal value,
+                                              well inside the ~474 mV smallest gap between bands */
+
+#define PP_IS_V(reading, target) \
+        ( (reading) >= ((target) - PP_V_TOLERANCE_mV) && (reading) <= ((target) + PP_V_TOLERANCE_mV) )
+
+/**
+ * @brief  Cable current rating decoded from the PP line voltage.
+ */
+typedef enum {
+    PP_CURRENT_13A = 0,   /**< ~2513 mV (1500 ohm) */
+    PP_CURRENT_20A,       /**< ~1951 mV (680 ohm)  */
+    PP_CURRENT_32A,       /**< ~1052 mV (220 ohm)  */
+    PP_CURRENT_63A,       /**< ~578 mV (100 ohm), three-phase */
+    PP_CURRENT_UNKNOWN    /**< No cable / voltage outside all known bands */
+} PP_Current_Rating;
+
+/**
+ * @brief  Classifies a PP line voltage reading into a cable current rating.
+ * @param  pp_mV Measured PP voltage in millivolts (see PP_Read_mV()).
+ * @return PP_Current_Rating (PP_CURRENT_UNKNOWN if it matches no known band).
+ */
+PP_Current_Rating PP_Classify_Voltage(uint16_t pp_mV);
+
+/**
+ * @brief  Converts a PP_Current_Rating to its amp value.
+ * @return Amps (13/20/32/63), or 0 for PP_CURRENT_UNKNOWN.
+ */
+uint8_t PP_Rating_To_Amps(PP_Current_Rating rating);
+
+#endif /* ENABLE_PP_SENSE */
 
 #endif /* INC_CP_H_ */

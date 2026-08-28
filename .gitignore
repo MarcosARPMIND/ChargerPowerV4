@@ -26,4 +26,8 @@ gdbClient_log.txt
 .DS_Store
 Thumbs.db
 
+# Python (tools/master_test.py)
+__pycache__/
+*.pyc
+
 !.settings

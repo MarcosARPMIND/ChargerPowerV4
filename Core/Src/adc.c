@@ -74,14 +74,14 @@ void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel
-  */
-  sConfig.Channel = ADC_CHANNEL_11;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN ADC1_Init 2 */
+  /* NOTE: Channel 11 (PA11, Proximity Pilot sense) is intentionally NOT
+   * added to the scan here. On this ADC, HAL_ADC_ConfigChannel() sets a bit
+   * in CHSELR per channel instead of replacing the whole sequence -- adding
+   * Channel 11 here would leave both Channel 0 (Control Pilot) and Channel 11
+   * enabled permanently, interleaving PP samples into the CP's continuous
+   * DMA buffer (see cp.c: CP_Raw_Max_Min()). PP_Read_mV() in cp.c enables
+   * Channel 11 on demand and restores Channel 0 afterwards instead. */
 
   /* USER CODE END ADC1_Init 2 */
 

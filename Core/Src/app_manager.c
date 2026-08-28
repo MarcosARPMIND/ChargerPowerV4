@@ -47,6 +47,10 @@ static bool     relay_open_checked = false;
 /* IEC 61851 Table A.5: Fault states must persist >= 300ms before recovery */
 static uint32_t fault_entry_tick = 0;
 
+/* Cable current rating detected via the PP coding resistor on connect
+ * (see case IDLE below). 0 = unknown / no cable currently connected. */
+static uint8_t g_cable_max_amps = 0;
+
 // Private Variables for Energy
 Energy_Data_t g_energy_line1 = {0};
 Energy_Data_t g_energy_line2 = {0};
@@ -70,17 +74,30 @@ static volatile uint16_t duty 		= 0;
 static volatile bool autorization 	= false;
 static volatile bool session_active	= false;
 
+/* Set by CMD_SET_CURRENT when 'duty' changes; only APP_MAIN() acts on it
+ * (see the check right before "Update persistent state" below), so that
+ * every CP hardware write stays inside the state machine's own actuation
+ * section instead of being called directly from the comms dispatcher. */
+static volatile bool g_duty_dirty = false;
+
 // Public Variables (External)
 volatile uint8_t flag_read_energy;
 volatile uint8_t flag_read_voltage;
 
 volatile uint8_t RCD_Fault = 0;
 
+/* Owned by main.c (set by the EXTI ISR, confirmed by the main-loop debounce).
+ * Must be cleared here too whenever we blank a stale RCD trip, or a pending
+ * EXTI event from before the blanking survives and re-confirms RCD_Fault on
+ * the very next main-loop pass -- silently undoing the blanking. */
+extern volatile bool rcd_pending_check;
+
 
 // Private Prototypes
 static void APP_Dispatch_Command(RS485_Frame_t* frame);
 static void APP_Safe_Shutdown(void);
 static void APP_Safety_Check_Electrical(void);
+static void APP_Update_Status_LED(STATE_MACHINE state);
 
 /**
  * @brief  Main State Machine Handler for EVSE.
@@ -103,6 +120,20 @@ void APP_MAIN(STATE_MACHINE *currentState) {
      * the confirmed state used by the rest of the state machine.
      * ────────────────────────────────────────────────────────────────────── */
     CP_State raw_cp = CP_GetState();
+
+    /* Expected transient: once we've killed the PWM to ask the EV to open S2
+     * (CHARGING with autorization/session already false, see the CHARGING
+     * case below), CP reads the still-connected state-C divider without any
+     * PWM -- which CP_GetState() reports as STATE_F by convention. This is
+     * neither a fault nor news: treat it exactly like STATE_UNKNOWN (discard,
+     * keep the last confirmed state) so it's never confirmed, never sent to
+     * the Master via CMD_STATE_NOTIFY, and the FSM simply waits for the real
+     * C->B transition once the EV actually reacts. A genuine CP fault while
+     * actually charging (autorization/session both still true) is untouched. */
+    if (*currentState == CHARGING && (!autorization || !session_active) && raw_cp == STATE_F)
+    {
+        raw_cp = STATE_UNKNOWN;
+    }
 
     /* Discard STATE_UNKNOWN entirely — it means the sample was unreadable.
      * Keep the last confirmed state; do not even start a new candidate count. */
@@ -199,6 +230,20 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 
 
             if (g_CP_STATE == STATE_B) { //EV present
+                /* Cable just connected — read its PP coding resistor once to
+                 * cap the current we may offer this session (see CMD_SET_CURRENT). */
+#if ENABLE_PP_SENSE
+                {
+                    PP_Current_Rating rating = PP_Classify_Voltage(PP_Read_mV());
+                    if (rating == PP_CURRENT_UNKNOWN) {
+                        g_nextState = FAULT_CABLE;
+                        break;
+                    }
+                    g_cable_max_amps = PP_Rating_To_Amps(rating);
+                }
+#else
+                g_cable_max_amps = CURRENT_LIMIT_HIGH; /* no PP circuit: cable imposes no extra cap */
+#endif
                 g_nextState = READY;
                 break;
             }
@@ -260,10 +305,19 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                  * The transition to CHARGING_COMPLETE will happen naturally
                  * when g_CP_STATE == STATE_B above. */
                 duty = 0;
+                g_duty_dirty = true;
             }
 
-            /* CP Error detected */
-            else if (g_CP_STATE == STATE_F) {
+            /* CP Error detected -- but NOT while we're mid-graceful-stop
+             * (see the branch above): once PWM is killed to ask the EV to
+             * open S2, CP reads the still-connected state-C divider without
+             * any PWM, which our own CP_GetState() reports as STATE_F by
+             * definition (DC + 6V-equivalent = invalid per IEC). That's the
+             * same transient CHARGING_COMPLETE already tolerates by never
+             * checking F at all -- here we only ignore it during this one
+             * window (autorization/session already false), a real CP fault
+             * while actually charging (both still true) still faults as before. */
+            else if (g_CP_STATE == STATE_F && autorization && session_active) {
                 g_nextState = FAULT_CAR;
             }
             /* IEC 61851: State E — CP short to PE */
@@ -344,6 +398,18 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             }
             break;
 
+        case FAULT_CABLE:
+            session_active = false;
+            /* Recover when the fault is cleared (CMD_CLEAR_FAULTS) or the
+             * cable is unplugged (CP_STATE == STATE_A) -- either way, the
+             * next connect attempt re-reads the PP resistor from scratch. */
+            if (((g_device_status.active_faults & FAULT_BIT_CABLE) == 0 || g_CP_STATE == STATE_A)
+                && (HAL_GetTick() - fault_entry_tick) >= 300) {
+                g_device_status.active_faults &= ~FAULT_BIT_CABLE;
+                g_nextState = IDLE;
+            }
+            break;
+
         default:
             g_nextState = IDLE; /* Failsafe */
             break;
@@ -370,6 +436,11 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 g_nextState = FAULT_RELAY_CONTACT;
                 /* Note: Don't return — let FAULT entry actions run below */
             }
+
+            /* Always unlock, even if a relay is welded: CP already told the EV
+             * to stop drawing current, and a permanently-stuck cable is worse
+             * than the residual risk of unplugging while welded. */
+            Board_Unlock_Cable();
         }
 
         /* B. ENTRY ACTIONS (Configuration for the new state) */
@@ -379,6 +450,11 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 CP_SetLine_High();
                 autorization   = false;
                 session_active = false;
+                g_cable_max_amps = 0; /* cable removed (or never connected) — unknown again */
+                duty = 0; /* Forget the last session's current -- a fresh connection
+                           * must wait for a new CMD_SET_CURRENT, not inherit whatever
+                           * was last requested (READY's entry action applies 'duty'
+                           * immediately if it's still nonzero). */
                 break;
 
             case READY:
@@ -394,13 +470,21 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 /* Pre-Charge Weld Check: Before closing relays, verify they are
                  * currently OPEN. If any reads as closed before we command them,
                  * it means a welded contact from a previous session. */
-                if (Board_Is_K1_Closed() || Board_Is_K4_Closed()) {
+                if (Board_Is_K1_Closed()
+#if !IGNORE_K4_FEEDBACK
+                    || Board_Is_K4_Closed()
+#endif
+                    ) {
                     g_device_status.active_faults |= FAULT_BIT_RELAY;
                     g_nextState = FAULT_RELAY_CONTACT;
                     CP_SetLine_Low();
                     break;
                 }
 
+                /* Lock the connector before energizing -- can't be pulled while live */
+                Board_Lock_Cable();
+
+                HAL_Delay(50); /* Allow the actuator to fully engage before energizing relays */
                 /* Energize Power Path Contactors */
                 Board_Set_Contactors(CMD_ACTIVATE);
 
@@ -410,12 +494,17 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                     APP_Safe_Shutdown();
                     g_nextState = FAULT_RELAY_CONTACT;
                     CP_SetLine_Low();
+                    Board_Unlock_Cable(); /* never actually energized -- no reason to stay locked */
                 } else {
                     /* EMI Blanking: The massive inrush current and contact bouncing
                      * typically couples into the RCD sensor line and triggers a false EXTI.
                      * We clear any RCD fault that occurred during the 50ms mechanical closing window.
-                     */
+                     * Also clear rcd_pending_check: if the EXTI fired during the
+                     * pull-in surge, that flag is still set and would otherwise
+                     * re-confirm RCD_Fault on the very next main-loop pass,
+                     * undoing this blanking immediately after it runs. */
                     RCD_Fault = 0;
+                    rcd_pending_check = false;
                     __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
                 }
                 break;
@@ -449,6 +538,14 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 fault_entry_tick = HAL_GetTick();
                 break;
 
+            case FAULT_CABLE:
+                /* PP coding resistor invalid/unreadable — nothing offered to the car */
+                g_device_status.active_faults |= FAULT_BIT_CABLE;
+                APP_Safe_Shutdown();
+                CP_SetLine_High();
+                fault_entry_tick = HAL_GetTick();
+                break;
+
             case FAULT_GRID:
             case FAULT_RCD:
                 /* Safety Shutdown: Force open contactors and reset CP */
@@ -463,8 +560,59 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 
     }
 
+    /* Apply a pending current-limit change from CMD_SET_CURRENT without
+     * waiting for a state transition -- covers both "Master sets current
+     * while already READY" and "Master adjusts current mid-CHARGING".
+     * Kept here, not in the dispatcher, so CP hardware is only ever
+     * touched from this function (see Section 2 above). */
+    if (g_duty_dirty && (g_nextState == READY || g_nextState == CHARGING)) {
+        /* duty==0 must NOT go through CP_SetDuty(): with CCR3=0 that is
+         * electrically identical to CP_SetLine_Low(), which reads back as
+         * STATE_F (fault) -- not "no current offered, EV still connected".
+         * Matches the same duty>0/else split already used in the READY
+         * entry action above. */
+        if (duty > 0) {
+            CP_SetDuty(duty);
+        } else {
+            CP_SetLine_High();
+        }
+        g_duty_dirty = false;
+    }
+
+    /* Status LED: blinks at a different rate depending on the final state
+     * for this cycle -- fast (700ms) on any fault, slower (2s) while
+     * charging, off otherwise. */
+    APP_Update_Status_LED(g_nextState);
+
     /* Update persistent state */
     *currentState = g_nextState;
+}
+
+/**
+ * @brief  Drives the general-purpose LED to reflect charging/fault status.
+ * @note   Stateless: derives on/off directly from HAL_GetTick(), so it needs
+ *         no extra timer or "last toggle" bookkeeping and self-corrects if
+ *         a cycle is skipped or delayed.
+ */
+static void APP_Update_Status_LED(STATE_MACHINE state) {
+    uint32_t period_ms;
+
+    bool is_fault = (state == FAULT_RCD || state == FAULT_RELAY_CONTACT ||
+                      state == FAULT_GRID || state == FAULT_CAR ||
+                      state == FAULT_CP_SHORT || state == FAULT_CABLE);
+
+    if (is_fault) {
+        period_ms = LED_PERIOD_FAULT_MS;
+    } else if (state == CHARGING) {
+        period_ms = LED_PERIOD_CHARGING_MS;
+    } else {
+        Board_Set_LED(false);
+        return;
+    }
+
+    /* Toggles every half-period -- true for the first half of each period,
+     * false for the second, giving a symmetric on/off blink. */
+    Board_Set_LED(((HAL_GetTick() / (period_ms / 2)) % 2) == 0);
 }
 
 // Retorna o número de bytes processados/descartados para que o main possa limpar o buffer
@@ -600,6 +748,7 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         case CMD_AUTH_FALSE:
         	autorization = false;
         	duty = 0; /* Kill PWM to signal car */
+        	g_duty_dirty = true;
 			//Send ACK
         	Transmit_frame.dest_ID = ID_MASTER;
         	Transmit_frame.cmd = CMD_AUTH_FALSE;
@@ -634,7 +783,8 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
         	session_active = false;
         	autorization = false;
-        	// duty = 0; /* Kill PWM to signal car */
+        	duty = 0; /* Kill PWM to signal car */
+        	g_duty_dirty = true;
         	Transmit_frame.dest_ID = ID_MASTER;
         	Transmit_frame.cmd = CMD_SESSION_STOP;
         	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
@@ -669,6 +819,13 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 							requested_current = CURRENT_LIMIT_LOW;
 				}
 
+#if ENABLE_PP_SENSE
+				/* 2b. Never offer more than what the connected cable supports */
+				if (g_cable_max_amps > 0 && requested_current > g_cable_max_amps) {
+							requested_current = g_cable_max_amps;
+				}
+#endif
+
 				/* * 3. Calculate Duty Cycle  (0.1% resolution, range 0-1000)
 				 * ------------------------------------------------------------------
 				 * Formula (IEC 61851-1): Duty(%) = Current(A) / 0.6
@@ -682,10 +839,12 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 				 */
 				duty = (uint16_t)(( (uint32_t)requested_current * 17070 ) >> 10);
 
-                /* If the EVSE is already waiting in READY state, apply the PWM immediately */
-                if (g_nextState == READY && duty > 0) {
-                    CP_SetDuty(duty);
-                }
+                /* Don't touch CP hardware from here -- just flag the change.
+                 * APP_MAIN() applies it (see near "Update persistent state")
+                 * whenever it's actually in READY or CHARGING, on this cycle
+                 * or a later one. Covers both a fresh request while READY
+                 * and a current-limit change mid-CHARGING (previously a no-op). */
+                g_duty_dirty = true;
 
 				//Send ACK
 	        	Transmit_frame.dest_ID = ID_MASTER;
@@ -710,6 +869,7 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
                 /* EMI Blanking for test command */
                 HAL_Delay(50);
                 RCD_Fault = 0;
+                rcd_pending_check = false;
                 __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
 
 				//Send ACK
@@ -1124,8 +1284,10 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
         if (!Board_Is_K2_Closed()) all_ok = false;
         if (!Board_Is_K3_Closed()) all_ok = false;
 #endif
+#if !IGNORE_K4_FEEDBACK
         if (!Board_Is_K4_Closed()) all_ok = false;
-        
+#endif
+
         if (all_ok) break; /* They all successfully closed! Proceed immediately. */
     }
 
@@ -1150,10 +1312,12 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
     }
 #endif
         
+#if !IGNORE_K4_FEEDBACK
     if (!Board_Is_K4_Closed()) {
         status->relay_errors |= RELAY_ERR_K4_CLOSE;
         all_ok = false;
     }
+#endif
 
     return all_ok;
 }
@@ -1182,8 +1346,10 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
         if (Board_Is_K2_Closed()) all_ok = false;
         if (Board_Is_K3_Closed()) all_ok = false;
 #endif
+#if !IGNORE_K4_FEEDBACK
         if (Board_Is_K4_Closed()) all_ok = false;
-        
+#endif
+
         if (all_ok) break; /* They all successfully opened (discharged)! */
     }
 
@@ -1206,10 +1372,12 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
         all_ok = false;
     }
 #endif
+#if !IGNORE_K4_FEEDBACK
     if (Board_Is_K4_Closed()) {
         status->relay_errors |= RELAY_ERR_K4_OPEN;
         all_ok = false;
     }
+#endif
 
     return all_ok;
 }

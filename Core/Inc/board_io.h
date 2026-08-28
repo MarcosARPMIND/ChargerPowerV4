@@ -21,6 +21,12 @@ typedef enum{
 	CMD_DEACTIVATE
 }PIN_STATE;
 
+typedef enum{
+	OPEN=0,
+	CLOSE,
+	OFF
+}ACTUATOR_STATE;
+
 void Board_init(void);
 
 void Board_ADE_Reset_1(PIN_STATE state);
@@ -34,6 +40,17 @@ void Board_Set_SPI_CS_3(PIN_STATE state);
 void Board_Set_RS485_DE(DE_STATE state);
 
 void Board_Set_Contactors(PIN_STATE state);
+
+void Board_Set_Actuator(ACTUATOR_STATE state);
+
+ACTUATOR_STATE Board_Get_Actuator_State(void);
+
+/* Cable lock: drives the H-bridge for one pulse, then de-energizes it */
+void Board_Lock_Cable(void);
+void Board_Unlock_Cable(void);
+
+/* General-purpose status LED */
+void Board_Set_LED(bool on);
 
 
 bool Board_Is_K1_Closed(void);

@@ -10,7 +10,7 @@
   * It facilitates hardware revision changes without modifying the
   * core application logic.
   *
-  * @version 1.0.0
+  * @version 1.1.4
   ******************************************************************************
   */
 
@@ -19,6 +19,7 @@
 
 //#include "main.h"
 #include "stm32c0xx_hal.h"
+#include "feature_config.h"
 
 /* ============================================================================== */
 /* SYSTEM CONFIGURATION                             */
@@ -29,6 +30,9 @@
  * Used for conditional compilation if distinct PCB revisions exist.
  */
 #define HW_VERSION                  0.0
+
+/* Feature toggles (SYSTEM_PHASES, ENABLE_PP_SENSE, ...) now live in
+ * feature_config.h, included above -- this file stays pin-mapping only. */
 
 /* --- ADE7953 RESET PINS (Outputs) --- */
 /* Individual hardware reset line per ADE7953 IC */
@@ -96,7 +100,7 @@
 /* --- RCD (Residual Current Device) --- */
 #define RCD_ERROR_PORT              GPIOC
 #define RCD_ERROR_PIN               GPIO_PIN_13     /* Input: Fault signal from RCD module */
-#define RCD_DEBOUNCE_MS             1              /* Software debounce window (ms) */
+#define RCD_DEBOUNCE_MS             30             /* Software debounce window (ms) */
 
 #define ADE_EXTI_PORT               GPIOA           /* Input: Interrupt Request (IRQ) */
 #define ADE_EXTI_PIN                GPIO_PIN_1      /* Configured via NVIC in CubeMX */

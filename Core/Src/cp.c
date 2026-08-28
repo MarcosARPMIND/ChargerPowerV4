@@ -224,3 +224,85 @@ CP_State CP_GetState(void)
         return STATE_UNKNOWN;
     }
 }
+
+#if ENABLE_PP_SENSE
+
+/**
+ * @brief  Reads the Proximity Pilot (PP) line voltage on PA11 (ADC1_IN11).
+ * @note   ADC1 is otherwise busy running a continuous DMA scan of the CP
+ *         line (Channel 0). This briefly stops that scan, takes one polled
+ *         conversion on Channel 11, then restores Channel 0 + DMA so the
+ *         CP reading resumes normally.
+ * @return PP line voltage in millivolts (0-3300, 12-bit ADC, VREF 3.3V).
+ */
+uint16_t PP_Read_mV(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+    uint16_t raw = 0;
+
+    HAL_ADC_Stop_DMA(&hadc1);
+
+    /* This ADC ORs each configured channel into CHSELR instead of replacing
+     * the whole sequence -- Channel 0 (CP) must be explicitly removed
+     * (Rank = ADC_RANK_NONE) or it stays in the scan and gets converted
+     * first, ahead of Channel 11, on every trigger. */
+    sConfig.Channel = ADC_CHANNEL_0;
+    sConfig.Rank    = ADC_RANK_NONE;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    sConfig.Channel = ADC_CHANNEL_11;
+    sConfig.Rank    = ADC_RANK_CHANNEL_NUMBER;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+    {
+        raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    }
+    HAL_ADC_Stop(&hadc1);
+
+    /* Restore: remove Channel 11, re-enable Channel 0, resume the CP's DMA scan */
+    sConfig.Channel = ADC_CHANNEL_11;
+    sConfig.Rank    = ADC_RANK_NONE;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    sConfig.Channel = ADC_CHANNEL_0;
+    sConfig.Rank    = ADC_RANK_CHANNEL_NUMBER;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)buffer_dma_raw, ADC_BUFFER_LIMIT);
+
+    return (uint16_t)(((uint32_t)raw * 3300u) / 4095u);
+}
+
+/**
+ * @brief  Classifies a PP line voltage reading into a cable current rating.
+ * @note   Checked from the smallest resistor (highest current) down, but the
+ *         non-overlapping tolerance windows make the order irrelevant.
+ */
+PP_Current_Rating PP_Classify_Voltage(uint16_t pp_mV)
+{
+    if (PP_IS_V(pp_mV, PP_V_100_OHM_mV))  { return PP_CURRENT_63A; }
+    if (PP_IS_V(pp_mV, PP_V_220_OHM_mV))  { return PP_CURRENT_32A; }
+    if (PP_IS_V(pp_mV, PP_V_680_OHM_mV))  { return PP_CURRENT_20A; }
+    if (PP_IS_V(pp_mV, PP_V_1500_OHM_mV)) { return PP_CURRENT_13A; }
+
+    return PP_CURRENT_UNKNOWN;
+}
+
+/**
+ * @brief  Converts a PP_Current_Rating to its amp value.
+ */
+uint8_t PP_Rating_To_Amps(PP_Current_Rating rating)
+{
+    switch (rating)
+    {
+        case PP_CURRENT_13A: return 13u;
+        case PP_CURRENT_20A: return 20u;
+        case PP_CURRENT_32A: return 32u;
+        case PP_CURRENT_63A: return 63u;
+        default:             return 0u;
+    }
+}
+
+#endif /* ENABLE_PP_SENSE */

@@ -71,6 +71,37 @@ volatile bool     rcd_pending_check = false;
 STATE_MACHINE currentState = IDLE;
 
 
+
+/* --- PC7 / TIM3_CH2 — relay-coil MOSFET economizer test ---
+ * Edit this value live in the debugger (Watch: right-click -> Set Value,
+ * or Debug Console: -exec set var test_mosfet_duty_permille = 300) to see
+ * the effect on the relay/MOSFET without recompiling.
+ * Range: 0-1000 (0.0% - 100.0%). Shares TIM3's 1 kHz base with the CP
+ * signal on CH3 -- only the duty is independent, not the frequency.
+ */
+
+/* Cable lock actuator feedback — volatile so it survives -Og and can be
+ * watched with Live Watch/Live Expressions without halting at a breakpoint
+ * (a breakpoint stops the whole CPU, so the H-bridge would stop moving too). */
+volatile ACTUATOR_STATE actuator_state = OPEN;
+
+#if ENABLE_PP_SENSE
+/* Proximity Pilot (PP) line voltage, PA11/ADC1_IN11 -- see PP_Read_mV() in cp.c */
+volatile uint16_t test_pp_mV = 0;
+volatile uint8_t  test_pp_amps = 0;   /* 13/20/32/63, or 0 if no cable/unknown */
+#endif /* ENABLE_PP_SENSE */
+
+/* --- Relay feedback diagnostic (temporary) ---
+ * Reads K1-K4 mirror contacts BEFORE commanding the relays, then again once
+ * closed, then again once re-opened -- to isolate whether any relay
+ * (K4 in particular) reads closed when it shouldn't (wiring/pull config on
+ * RELAY_STATE_x). Runs once at boot, before the main loop. Inspect in the
+ * debugger (Watch / Live Expressions). Remove once the wiring is confirmed.
+ */
+volatile bool diag_k1_before, diag_k2_before, diag_k3_before, diag_k4_before;
+volatile bool diag_k1_closed, diag_k2_closed, diag_k3_closed, diag_k4_closed;
+volatile bool diag_k1_after,  diag_k2_after,  diag_k3_after,  diag_k4_after;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,6 +112,8 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
 
 /* USER CODE END 0 */
 
@@ -121,11 +154,12 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM14_Init();
   MX_TIM17_Init();
-  MX_IWDG_Init();
+  //MX_IWDG_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
   CP_ADC_Init();
   Comms_INIT();
 
@@ -156,22 +190,38 @@ int main(void)
   ade7953_enable_reset_on_read(ADE_DEVICE_3);
 
 
-/*
-  Board_Set_Contactors(CMD_DEACTIVATE);
-  Board_Set_Contactors(CMD_ACTIVATE);
-  HAL_Delay(1000);
-  Board_Set_Contactors(CMD_DEACTIVATE);
-*/
+
   
-  //uint8_t state = HAL_GPIO_ReadPin(RELAY_STATE_1_PORT, RELAY_STATE_1_PIN);
-  //uint8_t state1 = HAL_GPIO_ReadPin(RELAY_STATE_4_PORT, RELAY_STATE_4_PIN);
+
 
   /* Clear transient EXTI triggers that occur during power-on */
   RCD_Fault = 0;
   rcd_pending_check = false;
   __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-  
+
   CP_SetLine_High();
+
+  // /* --- Relay feedback diagnostic (temporary) --- */
+  // Board_Set_Contactors(CMD_DEACTIVATE);   /* baseline: force open first */
+  // HAL_Delay(100);
+  // diag_k1_before = Board_Is_K1_Closed();
+  // diag_k2_before = Board_Is_K2_Closed();
+  // diag_k3_before = Board_Is_K3_Closed();
+  // diag_k4_before = Board_Is_K4_Closed();
+
+  // Board_Set_Contactors(CMD_ACTIVATE);     /* pull-in 150ms -> 30% hold, see board_io.c */
+  // HAL_Delay(100);                          /* extra settling beyond the pull-in/hold above */
+  // diag_k1_closed = Board_Is_K1_Closed();
+  // diag_k2_closed = Board_Is_K2_Closed();
+  // diag_k3_closed = Board_Is_K3_Closed();
+  // diag_k4_closed = Board_Is_K4_Closed();
+
+  // Board_Set_Contactors(CMD_DEACTIVATE);   /* open again -- don't leave energized */
+  // HAL_Delay(300);                          /* let AC optocouplers discharge, same margin as APP_Verify_Relays_Open() */
+  // diag_k1_after = Board_Is_K1_Closed();
+  // diag_k2_after = Board_Is_K2_Closed();
+  // diag_k3_after = Board_Is_K3_Closed();
+  // diag_k4_after = Board_Is_K4_Closed();
 
   /* USER CODE END 2 */
 
@@ -189,15 +239,10 @@ int main(void)
    *
    * ----------------------------------------------------------- */
 
-  //APP_TEST_Contactor_Monitor();
 
-  //volatile  uint32_t raw_A = ade7953_Read_Reg(ADE_DEVICE_1, 0x031A, 4);  // IRMSA
-  //volatile  uint32_t raw_B = ade7953_Read_Reg(ADE_DEVICE_1, 0x031B, 4);  // IRMSB
 
   while (1)
   {
-
-
 
 
       // 0. RCD Debounce Validation
@@ -212,14 +257,18 @@ int main(void)
           }
       }
 
-      // 1. Process Communications
-	  APP_Comms_Task();
+      /* RCD_Fault (once confirmed above) is handled inside APP_MAIN() itself,
+       * with top priority over any state -- it opens the contactors, unlocks
+       * the cable once relays are confirmed open, and transitions to
+       * FAULT_RCD. No need to react to it here too. */
 
-      // 2. Main State Machine
-      APP_MAIN(&currentState);
 
-      // 3. Energy Monitoring
-      APP_Energy_Task();
+      HAL_Delay(100);
+
+      // --- Normal operation (disabled during bring-up test) ---
+       APP_Comms_Task();
+       APP_MAIN(&currentState);
+       APP_Energy_Task();
 
   //    HAL_IWDG_Refresh(&hiwdg);
 
