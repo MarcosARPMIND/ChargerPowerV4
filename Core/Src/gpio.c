@@ -87,7 +87,10 @@ void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB0 PB1 -- K4/K1 relay feedback (RELAY_STATE_4/1)
-     Pull-down for the same reason as PA6/PA7 above. */
+     Pull-down for the same reason as PA6/PA7 above. K4 feedback is still
+     ignored in software (IGNORE_K4_FEEDBACK, feature_config.h) since PB0
+     reads permanently HIGH regardless of pull config -- not a floating-pin
+     issue on that one, but the pull-down stays for consistency. */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;

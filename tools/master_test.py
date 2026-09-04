@@ -114,6 +114,38 @@ FAULT_BIT_NAMES = [
     "CABO (PP)",                # bit 7
 ]
 
+# CMD_RELAY_GET / data_RX[1] -- estado ao vivo dos contactores (ver
+# APP_Dispatch_Command() no firmware). K2/K3 so tem significado com
+# SYSTEM_PHASES==3; em build monofasico ficam sempre a 0.
+RELAY_STATE_BIT_NAMES = [
+    "K1 fechado",   # bit 0
+    "K2 fechado",   # bit 1
+    "K3 fechado",   # bit 2
+    "K4 fechado",   # bit 3
+]
+
+# CMD_GET_FAULTS / data_RX[2] -- detalhe por contactor (ver
+# APP_Verify_Relays_Closed/Open e RELAY_ERR_* em app_manager.h).
+# Bits [3:0] = falhou fechar, bits [7:4] = soldado (nao abriu).
+RELAY_ERROR_BIT_NAMES = [
+    "K1 falhou fechar",        # bit 0
+    "K2 falhou fechar",        # bit 1
+    "K3 falhou fechar",        # bit 2
+    "K4 falhou fechar",        # bit 3
+    "K1 soldado (nao abriu)",  # bit 4
+    "K2 soldado (nao abriu)",  # bit 5
+    "K3 soldado (nao abriu)",  # bit 6
+    "K4 soldado (nao abriu)",  # bit 7
+]
+
+
+def fmt_bitmask(value, names, none_label):
+    """Decodifica um bitmask numa lista de nomes, um por bit definido."""
+    if value == 0:
+        return none_label
+    return ", ".join(name for i, name in enumerate(names) if value & (1 << i))
+
+
 # Comandos que o proprio script emite e para os quais espera 1 resposta
 _ACK_ONLY_CMDS = {
     CMD_AUTH_TRUE, CMD_AUTH_FALSE, CMD_SESSION_START, CMD_SESSION_STOP,
@@ -133,13 +165,15 @@ def build_frame(dest_id, cmd, data=b""):
 
 
 def fmt_faults(active_faults, relay_errors):
-    if active_faults == 0:
-        faults_str = "nenhuma"
-    else:
-        faults_str = ", ".join(
-            name for i, name in enumerate(FAULT_BIT_NAMES) if active_faults & (1 << i)
-        )
-    return f"active_faults=0x{active_faults:02X} ({faults_str})  relay_errors=0x{relay_errors:02X}"
+    faults_str = fmt_bitmask(active_faults, FAULT_BIT_NAMES, "nenhuma")
+    relay_err_str = fmt_bitmask(relay_errors, RELAY_ERROR_BIT_NAMES, "nenhum")
+    return (f"active_faults=0x{active_faults:02X} ({faults_str})  "
+            f"relay_errors=0x{relay_errors:02X} ({relay_err_str})")
+
+
+def fmt_relay_state(relay_state):
+    state_str = fmt_bitmask(relay_state, RELAY_STATE_BIT_NAMES, "todos abertos")
+    return f"relay_state=0x{relay_state:02X} ({state_str})"
 
 
 # --------------------------------------------------------------------------
@@ -281,8 +315,7 @@ def cmd_status(link):
 
     data = link.request(CMD_RELAY_GET)
     if data and len(data) >= 2:
-        relay_state = data[1]
-        print(f"Reles (K1..K4 fechados=bit1): 0x{relay_state:02X}")
+        print(fmt_relay_state(data[1]))
 
 
 def _decode_3line_u16(data, scale, unit):
@@ -319,6 +352,44 @@ def cmd_faults(link):
         print(fmt_faults(data[1], data[2]))
     else:
         print("Sem resposta.")
+
+
+def cmd_relays(link):
+    """CMD_RELAY_GET isolado -- util para ver, no momento de um FAULT_BIT_RELAY,
+    qual contactor especifico (K1..K4) esta a ler fechado."""
+    data = link.request(CMD_RELAY_GET)
+    if data and len(data) >= 2:
+        print(fmt_relay_state(data[1]))
+    else:
+        print("Sem resposta.")
+
+
+def cmd_relay_raw(link, activate):
+    """CMD_RELAY_SET / CMD_RELAY_RESET -- fecha/abre os contactores
+    DIRETAMENTE, sem passar pela state machine (sem lock do cabo, sem
+    pre-charge weld check, sem verificar se fecharam mesmo). E' o comando de
+    teste de bancada do firmware ('activation here only for test purposes'
+    em app_manager.c) -- nao usar com um veiculo real ligado."""
+    if activate:
+        print("AVISO: a fechar os contactores diretamente (sem lock do cabo nem "
+              "verificacoes de seguranca). So para teste de bancada, sem carro ligado.")
+        data = link.request(CMD_RELAY_SET)
+        if data is None:
+            print("Sem resposta (timeout).")
+        elif data[0] == CMD_ACK:
+            print("Contactores fechados (ACK).")
+        elif data[0] == CMD_NACK:
+            print("NACK -- recusado (provavelmente FAULT_BIT_RCD ativo). Usa 'faults'.")
+        else:
+            print(f"Resposta inesperada: {data.hex(' ')}")
+    else:
+        data = link.request(CMD_RELAY_RESET)
+        if data is None:
+            print("Sem resposta (timeout).")
+        elif data[0] == CMD_ACK:
+            print("Contactores abertos (ACK).")
+        else:
+            print(f"Resposta inesperada: {data.hex(' ')}")
 
 
 def cmd_clear_faults(link):
@@ -364,7 +435,10 @@ Comandos disponiveis:
   charge <A> | c <A>  Autoriza + inicia sessao + pede corrente <A> (6-33)
   current <A>         Ajusta so a corrente durante a sessao (6-33)
   stop                Termina a sessao (SESSION_STOP + AUTH_FALSE)
-  faults              Mostra falhas ativas
+  faults              Mostra falhas ativas (com detalhe por rele)
+  relays | r          Estado ao vivo dos contactores K1..K4 (CMD_RELAY_GET)
+  relay on|off        Atua os contactores DIRETAMENTE (so teste de bancada,
+                      sem veiculo -- salta lock/weld-check/verificacao)
   clear               Limpa falhas (CMD_CLEAR_FAULTS)
   ping                Heartbeat
   raw on|off          Mostra/esconde os bytes TX/RX crus
@@ -431,6 +505,13 @@ def main():
                 cmd_stop(link)
             elif op == "faults":
                 cmd_faults(link)
+            elif op in ("relays", "r"):
+                cmd_relays(link)
+            elif op == "relay":
+                if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+                    print("Uso: relay on|off")
+                    continue
+                cmd_relay_raw(link, parts[1].lower() == "on")
             elif op == "clear":
                 cmd_clear_faults(link)
             elif op == "ping":

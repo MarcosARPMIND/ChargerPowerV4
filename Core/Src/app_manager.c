@@ -353,6 +353,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             /* IEC 61851 Table A.5: minimum 300ms dwell before recovery */
             if (((g_device_status.active_faults & FAULT_BIT_CP_ERROR) == 0 || g_CP_STATE == STATE_A)
                 && (HAL_GetTick() - fault_entry_tick) >= 300) {
+                g_device_status.active_faults &= ~FAULT_BIT_CP_ERROR;
                 g_nextState = IDLE;
             }
             break;
@@ -469,16 +470,28 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             case CHARGING:
                 /* Pre-Charge Weld Check: Before closing relays, verify they are
                  * currently OPEN. If any reads as closed before we command them,
-                 * it means a welded contact from a previous session. */
-                if (Board_Is_K1_Closed()
+                 * it means a welded contact from a previous session.
+                 * Settle first -- same reasoning as APP_Verify_Relays_*(): reading
+                 * the feedback the instant we enter this state, with no delay at
+                 * all, catches transient noise (e.g. from CP switching to PWM
+                 * right as this runs) as a false "welded" reading. */
+                HAL_Delay(RELAY_SETTLING_TIME_MS);
+
+                {
+                    bool k1_closed = Board_Is_K1_Closed();
 #if !IGNORE_K4_FEEDBACK
-                    || Board_Is_K4_Closed()
+                    bool k4_closed = Board_Is_K4_Closed();
+#else
+                    bool k4_closed = false;
 #endif
-                    ) {
-                    g_device_status.active_faults |= FAULT_BIT_RELAY;
-                    g_nextState = FAULT_RELAY_CONTACT;
-                    CP_SetLine_Low();
-                    break;
+                    if (k1_closed || k4_closed) {
+                        if (k1_closed) g_device_status.relay_errors |= RELAY_ERR_K1_OPEN;
+                        if (k4_closed) g_device_status.relay_errors |= RELAY_ERR_K4_OPEN;
+                        g_device_status.active_faults |= FAULT_BIT_RELAY;
+                        g_nextState = FAULT_RELAY_CONTACT;
+                        CP_SetLine_Low();
+                        break;
+                    }
                 }
 
                 /* Lock the connector before energizing -- can't be pulled while live */
@@ -862,6 +875,10 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
         case CMD_RELAY_SET: // activation here only for test purposes
 
+        	Transmit_frame.dest_ID = ID_MASTER;
+        	Transmit_frame.cmd = CMD_RELAY_SET;
+        	Transmit_frame.len = 1;
+
         	if( !(g_device_status.active_faults & FAULT_BIT_RCD) ){
 
         		Board_Set_Contactors(CMD_ACTIVATE);
@@ -873,11 +890,14 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
                 __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
 
 				//Send ACK
-				Transmit_frame.dest_ID = ID_MASTER;
-				Transmit_frame.cmd = CMD_RELAY_SET;
 				Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
-				Transmit_frame.len = 1;
 				APP_RS485_Send_Message(&Transmit_frame);
+        	}
+        	else {
+        		/* Refused: RCD fault active -- tell the Master why instead of
+        		 * leaving it to time out with no idea what happened. */
+        		Transmit_frame.data_RX[0] = (uint8_t)CMD_NACK;
+        		APP_RS485_Send_Message(&Transmit_frame);
         	}
 
         	break;
@@ -903,8 +923,11 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         		g_device_status.relay_state &=~RELAY_ERR_K1_CLOSE;
         	}
 
-#if SYSTEM_PHASES == 3
-        	if(Board_Is_K2_C losed()){
+        	/* K2/K3 are read unconditionally here for diagnostics, even though
+        	 * SYSTEM_PHASES==1 excludes them from the safety-relevant checks
+        	 * (APP_Verify_Relays_Closed/Open) -- otherwise their feedback pins
+        	 * are wired but nothing ever reports what they're actually doing. */
+        	if(Board_Is_K2_Closed()){
         		g_device_status.relay_state |= RELAY_ERR_K2_CLOSE;
         	}
         	else{
@@ -917,7 +940,6 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         	else{
         		g_device_status.relay_state &=~RELAY_ERR_K3_CLOSE;
         	}
-#endif
 
         	if(Board_Is_K4_Closed()){
         		g_device_status.relay_state |= RELAY_ERR_K4_CLOSE;
@@ -1055,6 +1077,9 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         	uint16_t e3 = (uint16_t)(g_energy_line3.session_energy_Wh / 100);
         	Transmit_frame.data_RX[5] = (uint8_t)(e3>>8); //MSB
         	Transmit_frame.data_RX[6] = (uint8_t)(e3 & 0xFF);//LSB
+
+        	Transmit_frame.len = 7;
+        	APP_RS485_Send_Message(&Transmit_frame);
 
         	break;
 
@@ -1295,6 +1320,11 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
     status->relay_errors &= ~RELAY_ERR_CLOSE_MASK;
     HAL_Delay(50);
 
+    /* Final decisive read: start clean so a stale timeout from the polling
+     * loop above can't fail this check when the relays are actually fine
+     * by now -- only an actual closed-check failure below may set false. */
+    all_ok = true;
+
     /* If they never closed after 250ms, register the faults */
     if (!Board_Is_K1_Closed()) {
         status->relay_errors |= RELAY_ERR_K1_CLOSE;
@@ -1356,6 +1386,11 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
     /* Clear previous open errors, preserve close errors */
     status->relay_errors &= ~RELAY_ERR_OPEN_MASK;
     //HAL_Delay(100);
+
+    /* Final decisive read: start clean so a stale timeout from the polling
+     * loop above can't fail this check when the relays are actually fine
+     * by now -- only an actual still-closed reading below may set false. */
+    all_ok = true;
 
     /* If they never discharged/opened after 250ms, register the welded fault */
     if (Board_Is_K1_Closed()) {

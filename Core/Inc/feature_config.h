@@ -71,6 +71,6 @@
  * @where_used app_manager.c: CHARGING entry weld check, APP_Verify_Relays_*().
  * @todo   Set back to 0 once PB0 is fixed/confirmed on hardware.
  */
-#define IGNORE_K4_FEEDBACK          0
+#define IGNORE_K4_FEEDBACK          1
 
 #endif /* INC_FEATURE_CONFIG_H_ */

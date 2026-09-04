@@ -35,7 +35,7 @@
 #define IRMS_LSB_mA_device3     65536u   // mA por LSB
 #define IRMS_LSB_mA_device2     65536u   // mA por LSB
 //#define IRMS_LSB_mA_device1     65536u   // mA por LSB
-#define IRMS_LSB_mA_device1     179u
+#define IRMS_LSB_mA_device1     874u
 
 
 #define POWER_LSB_mW_device3    65536u   // mW por LSB

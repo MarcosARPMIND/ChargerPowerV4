@@ -100,7 +100,7 @@
 /* --- RCD (Residual Current Device) --- */
 #define RCD_ERROR_PORT              GPIOC
 #define RCD_ERROR_PIN               GPIO_PIN_13     /* Input: Fault signal from RCD module */
-#define RCD_DEBOUNCE_MS             30             /* Software debounce window (ms) */
+#define RCD_DEBOUNCE_MS             15             /* Software debounce window (ms) */
 
 #define ADE_EXTI_PORT               GPIOA           /* Input: Interrupt Request (IRQ) */
 #define ADE_EXTI_PIN                GPIO_PIN_1      /* Configured via NVIC in CubeMX */

@@ -77,8 +77,15 @@
  * @brief    Tolerance windows to prevent state flickering due to noise.
  * @{
  */
+/* TOLERANCE_NEG must stay <= the gap between adjacent STATE_x_RAW_VAL
+ * thresholds (358) minus TOLERANCE_POS, or neighbouring state windows
+ * overlap -- a reading in the overlap is always classified as the state
+ * closer to A (checked first in CP_GetState()), which on a real vehicle
+ * (component tolerance, cable drop, PWM noise -- unlike a bench simulator
+ * with exact resistors) caused genuine STATE_C readings to be misread as
+ * STATE_B and back, every time the signal wandered into that zone. */
 #define TOLERANCE_POS       150     /* Upper/Lower bound for positive peaks */
-#define TOLERANCE_NEG       300     /* Upper/Lower bound for negative floor */
+#define TOLERANCE_NEG       150     /* Upper/Lower bound for negative floor */
 /** @} */
 
 
