@@ -189,6 +189,9 @@ int main(void)
   ade7953_enable_reset_on_read(ADE_DEVICE_2);
   ade7953_enable_reset_on_read(ADE_DEVICE_3);
 
+  /* --- LM75B temperature sensor (I2C1: PA9 SCL / PA10 SDA, OS on PD1) ---
+   * Well past the sensor's first ~100ms conversion by now (HAL_Delay above). */
+  APP_Temp_Init();
 
 
   
@@ -269,6 +272,7 @@ int main(void)
        APP_Comms_Task();
        APP_MAIN(&currentState);
        APP_Energy_Task();
+       APP_Temp_Task();
 
   //    HAL_IWDG_Refresh(&hiwdg);
 

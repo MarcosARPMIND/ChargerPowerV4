@@ -125,10 +125,12 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : os_temp_Pin */
+  /*Configure GPIO pin : os_temp_Pin -- LM75B OS output (open-drain, active LOW)
+     Pull-up: OS only ever sinks, so without one the line floats while inactive.
+     Harmless in parallel with an external pull-up if the PCB has one. */
   GPIO_InitStruct.Pin = os_temp_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(os_temp_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/

@@ -11,6 +11,7 @@
 #include "cp.h"
 #include "board_io.h"
 #include "energy_meter.h"
+#include "temp_sensor.h"
 #include "feature_config.h"
 #include "stm32c0xx_hal.h"
 #include <stdbool.h>
@@ -109,6 +110,12 @@
 #define GRID_UNDERVOLT_THRESH_mV  207000   /* 207V = 230V - 10% */
 /* Overcurrent Limit (milliamps) — matches CURRENT_LIMIT_HIGH with margin */
 #define OVERCURRENT_THRESH_mA     35000    /* 35A — above 33A hard limit */
+
+/* Temperature (LM75B) — OS output thresholds, written to the sensor at init */
+#define TEMP_OS_THRESH_C          80       /* OS asserts above 80°C (LM75B power-on default) */
+#define TEMP_OS_HYST_C            75       /* ...and releases below 75°C (LM75B power-on default) */
+#define TEMP_READ_INTERVAL_MS     1000     /* Sensor converts every 100ms; 1s is plenty for thermal drift */
+#define TEMP_MAX_READ_ERRORS      3        /* Consecutive I2C failures before the reading is declared invalid */
 
 /* SYSTEM_PHASES now lives in feature_config.h, included above */
 
@@ -211,6 +218,8 @@ void APP_Comms_Task(void);
 void APP_Energy_Flag_Set(void);
 void APP_Voltage_Flag_Set(void);
 void APP_Energy_Task(void);
+void APP_Temp_Init(void);
+void APP_Temp_Task(void);
 void APP_MAIN(STATE_MACHINE *currentState);
 
 /* Relay Verification */

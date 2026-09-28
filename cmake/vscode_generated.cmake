@@ -30,6 +30,7 @@ target_sources(${BUILD_UNIT_0_NAME} PRIVATE
     "Core/Src/syscalls.c"
     "Core/Src/sysmem.c"
     "Core/Src/system_stm32c0xx.c"
+    "Core/Src/temp_sensor.c"
     "Core/Src/tim.c"
     "Core/Src/usart.c"
     "Core/Startup/startup_stm32c031c6tx.s"

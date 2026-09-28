@@ -1,0 +1,31 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ST-Link GDB Server",
+            "type": "shell",
+            "command": "/opt/st/stm32cubeclt_1.21.0/STLink-gdb-server/bin/ST-LINK_gdbserver",
+            "args": [
+                "-cp", "/opt/st/stm32cubeclt_1.21.0/STM32CubeProgrammer/bin",
+                "-d",
+                "-p", "61234"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^never matches$"
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "Starting server",
+                    "endsPattern": "Waiting for debugger connection"
+                }
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        }
+    ]
+}

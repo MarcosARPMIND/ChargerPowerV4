@@ -56,6 +56,9 @@ Energy_Data_t g_energy_line1 = {0};
 Energy_Data_t g_energy_line2 = {0};
 Energy_Data_t g_energy_line3 = {0};
 
+// LM75B temperature sensor (see APP_Temp_Task)
+Temp_Data_t g_temperature = {0};
+
 // Device Status (Error tracking)
 DeviceStatus_t g_device_status = {0};
 
@@ -1273,6 +1276,52 @@ void APP_Energy_Task(void) {
 	}
 
 
+}
+
+/**
+ * @brief  Configures the LM75B temperature sensor (OS thresholds, fault queue).
+ * @note   Called once at boot from main.c; APP_Temp_Task() retries it if the
+ *         sensor did not answer then.
+ */
+void APP_Temp_Init(void) {
+	g_temperature.configured = (LM75B_INIT(TEMP_OS_THRESH_C, TEMP_OS_HYST_C) == HAL_OK);
+}
+
+/**
+ * @brief  Temperature Monitoring Task.
+ * @note   Reads the LM75B every TEMP_READ_INTERVAL_MS and caches the result in
+ *         g_temperature. The OS pin is sampled on the same cadence -- it is the
+ *         sensor's own hardware thermostat and stays meaningful even if I2C fails.
+ */
+void APP_Temp_Task(void) {
+	static uint32_t last_read_tick = 0;
+	int32_t temp_mC;
+
+	if ((HAL_GetTick() - last_read_tick) < TEMP_READ_INTERVAL_MS) {
+		return;
+	}
+	last_read_tick = HAL_GetTick();
+
+	/* Sensor didn't answer at boot: keep retrying instead of leaving it on
+	 * its power-on defaults (fault queue 1) for good. */
+	if (!g_temperature.configured) {
+		APP_Temp_Init();
+	}
+
+	if (lm75b_get_temp_mC(&temp_mC) == HAL_OK) {
+		g_temperature.temp_mC     = temp_mC;
+		g_temperature.read_errors = 0;
+		g_temperature.valid       = true;
+	} else {
+		if (g_temperature.read_errors < UINT8_MAX) {
+			g_temperature.read_errors++;
+		}
+		if (g_temperature.read_errors >= TEMP_MAX_READ_ERRORS) {
+			g_temperature.valid = false;
+		}
+	}
+
+	g_temperature.os_active = lm75b_is_os_active();
 }
 
 /**

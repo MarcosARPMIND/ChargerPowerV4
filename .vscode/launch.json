@@ -14,6 +14,18 @@
                     "imageFileName": "${workspaceFolder}/build/Debug/ChargerPowerV4.elf"
                 }
             ]
+        },
+        {
+            "name": "Cortex-Debug: Flash + Debug (ST-Link)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/ChargerPowerV4.elf",
+            "servertype": "external",
+            "gdbPath": "/opt/st/stm32cubeclt_1.21.0/GNU-tools-for-STM32/bin/arm-none-eabi-gdb",
+            "gdbTarget": "localhost:61234",
+            "preLaunchTask": "ST-Link GDB Server",
+            "runToEntryPoint": "main"
         }
     ]
 }
