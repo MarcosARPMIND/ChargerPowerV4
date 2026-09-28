@@ -84,13 +84,25 @@
 #define UART1_TX_PORT               GPIOA
 #define UART1_TX_PIN                GPIO_PIN_9
 
-/* --- I2C1 (Temperature Sensor) --- */
-/* Note: I2C pins are configured via CubeMX (.ioc). Defined here for context only. */
-#define I2C1_SCL_PORT               GPIOA
-#define I2C1_SCL_PIN                GPIO_PIN_9
+/* --- Relay Feedback Measurement-Circuit Enable (repurposed I2C1 pins) --- */
+/* K1/K4 relay feedback (RELAY_STATE_1/4) needs its sense circuit actively
+ * powered before the reading is valid -- these were I2C1_SCL/SDA (also
+ * labelled UART1_TX/RX above; neither peripheral is actually instantiated
+ * in this build, see usart.c/i2c.c), now freed up since the temperature
+ * sensor was never implemented. I2C1 is disabled (main.c) so these two
+ * pins can drive the measurement-circuit enable lines instead. */
+#define K1_MEAS_ENABLE_PORT         GPIOA
+#define K1_MEAS_ENABLE_PIN          GPIO_PIN_9      /* was I2C1_SCL */
 
-#define I2C1_SDA_PORT               GPIOA
-#define I2C1_SDA_PIN                GPIO_PIN_10
+#define K4_MEAS_ENABLE_PORT         GPIOA
+#define K4_MEAS_ENABLE_PIN          GPIO_PIN_10     /* was I2C1_SDA -- unused now, see K2_WELD_TEST_PIN below */
+
+/* TEMPORARY bench-test wiring (K2_WELD_TEST_OVERRIDE, feature_config.h):
+ * same physical pin as K4_MEAS_ENABLE_PIN above (PA10 / ex I2C1_SDA / STM
+ * pin 32), reused as an input for the phase-2 (K2) weld detector while the
+ * hardware fix is pending. Remove once reverted to normal RELAY_STATE_2. */
+#define K2_WELD_TEST_PORT           GPIOA
+#define K2_WELD_TEST_PIN            GPIO_PIN_10
 
 
 /* ============================================================================== */

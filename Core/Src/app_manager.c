@@ -92,6 +92,22 @@ volatile uint8_t RCD_Fault = 0;
  * the very next main-loop pass -- silently undoing the blanking. */
 extern volatile bool rcd_pending_check;
 
+/* Owned by main.c -- extends RCD blanking forward in time (see the debounce
+ * block there). The RCD module's fault pulse can start with some latency
+ * relative to the K1/K4 sense-circuit activation edge and lasts ~60ms, so a
+ * one-shot clear right when a verification window closes isn't enough --
+ * this keeps suppressing confirmation until well past that window. */
+extern volatile uint32_t rcd_blank_until_tick;
+#define RCD_BLANK_MARGIN_MS  200u  /**< Comfortably > the observed ~60ms RCD pulse width */
+
+#if ENABLE_PP_SENSE
+/* Owned by main.c -- debug mirror of the last PP reading, see the IDLE
+ * case below. Inspect in the debugger (Watch / Live Expressions) to
+ * calibrate PP_V_*_OHM_mV (cp.h) against this board's actual PP circuit. */
+extern volatile uint16_t test_pp_mV;
+extern volatile uint8_t  test_pp_amps;
+#endif
+
 
 // Private Prototypes
 static void APP_Dispatch_Command(RS485_Frame_t* frame);
@@ -187,24 +203,6 @@ void APP_MAIN(STATE_MACHINE *currentState) {
         goto actuate;
     }
 
-    if(g_CP_LAST_STATE != g_CP_STATE){
-
-    	g_CP_LAST_STATE = g_CP_STATE;
-
-    	RS485_Frame_t Transmit_frame;
-    	memset(&Transmit_frame, 0, sizeof(Transmit_frame));
-    	Transmit_frame.dest_ID = ID_MASTER;
-    	Transmit_frame.cmd = CMD_STATE_NOTIFY;
-    	Transmit_frame.data_RX[0] = (uint8_t)g_CP_STATE;
-    	Transmit_frame.len = 1;
-    	APP_RS485_Send_Message(&Transmit_frame);
-
-    	g_waiting_state_ack = true;
-    	g_state_notify_tick = HAL_GetTick();
-    	g_state_notify_retries  = 0;
-
-    }
-
 
 
     /* -----------------------------------------------------------
@@ -234,7 +232,13 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                  * cap the current we may offer this session (see CMD_SET_CURRENT). */
 #if ENABLE_PP_SENSE
                 {
-                    PP_Current_Rating rating = PP_Classify_Voltage(PP_Read_mV());
+                    uint16_t pp_mV = PP_Read_mV();
+                    PP_Current_Rating rating = PP_Classify_Voltage(pp_mV);
+                    /* Debug mirror (see main.c) -- inspect in the debugger
+                     * (Watch / Live Expressions) to calibrate PP_V_*_OHM_mV
+                     * against this board's actual PP pull-up/divider. */
+                    test_pp_mV = pp_mV;
+                    test_pp_amps = PP_Rating_To_Amps(rating);
                     if (rating == PP_CURRENT_UNKNOWN) {
                         g_nextState = FAULT_CABLE;
                         break;
@@ -416,6 +420,30 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             break;
     }
 
+    /* CP state-change notify -- sent after the switch above (not before it)
+     * so that a cable just connected (IDLE case, STATE_B) has already had
+     * its PP resistor read and g_cable_max_amps updated by the time this
+     * builds the frame; sending it earlier reported the stale pre-connect
+     * value (0/"unknown") one cycle early. */
+    if(g_CP_LAST_STATE != g_CP_STATE){
+
+    	g_CP_LAST_STATE = g_CP_STATE;
+
+    	RS485_Frame_t Transmit_frame;
+    	memset(&Transmit_frame, 0, sizeof(Transmit_frame));
+    	Transmit_frame.dest_ID = ID_MASTER;
+    	Transmit_frame.cmd = CMD_STATE_NOTIFY;
+    	Transmit_frame.data_RX[0] = (uint8_t)g_CP_STATE;
+    	Transmit_frame.data_RX[1] = g_cable_max_amps; /* PP-derived cable rating, 0 if unknown/no cable */
+    	Transmit_frame.len = 2;
+    	APP_RS485_Send_Message(&Transmit_frame);
+
+    	g_waiting_state_ack = true;
+    	g_state_notify_tick = HAL_GetTick();
+    	g_state_notify_retries  = 0;
+
+    }
+
     /* -----------------------------------------------------------
      * SECTION 2: HARDWARE ACTUATION (ENTRY/EXIT ACTIONS)
      * Only executes when a state transition occurs.
@@ -437,6 +465,8 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 g_nextState = FAULT_RELAY_CONTACT;
                 /* Note: Don't return — let FAULT entry actions run below */
             }
+            /* Note: RCD EMI blanking now lives inside APP_Verify_Relays_Open()
+             * itself, right after its relay-measurement circuit window closes. */
 
             /* Always unlock, even if a relay is welded: CP already told the EV
              * to stop drawing current, and a permanently-stuck cable is worse
@@ -468,13 +498,15 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 break;
 
             case CHARGING:
-                /* Pre-Charge Weld Check: Before closing relays, verify they are
+                /* Relay Verification Activation: Before closing relays, verify they are
                  * currently OPEN. If any reads as closed before we command them,
                  * it means a welded contact from a previous session.
                  * Settle first -- same reasoning as APP_Verify_Relays_*(): reading
                  * the feedback the instant we enter this state, with no delay at
                  * all, catches transient noise (e.g. from CP switching to PWM
                  * right as this runs) as a false "welded" reading. */
+                Board_Enable_Relay_Measurement(CMD_ACTIVATE);
+                HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
                 HAL_Delay(RELAY_SETTLING_TIME_MS);
 
                 {
@@ -484,6 +516,24 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 #else
                     bool k4_closed = false;
 #endif
+                    Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
+
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
+                    /* EMI Blanking: powering the K1/K4 sense circuit (and the
+                     * settling delay above) is the actual moment noise has been
+                     * observed coupling into the RCD sensor line -- not the
+                     * relay coil switching itself. Clear any RCD fault/pending
+                     * check picked up during this verification window so a
+                     * routine pre-charge check isn't misread as a real
+                     * residual-current event, and extend the blanking window
+                     * forward -- the RCD module's ~60ms pulse can start with
+                     * some latency, possibly after this point. */
+                    RCD_Fault = 0;
+                    rcd_pending_check = false;
+                    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+                    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+#endif
+
                     if (k1_closed || k4_closed) {
                         if (k1_closed) g_device_status.relay_errors |= RELAY_ERR_K1_OPEN;
                         if (k4_closed) g_device_status.relay_errors |= RELAY_ERR_K4_OPEN;
@@ -501,24 +551,16 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 /* Energize Power Path Contactors */
                 Board_Set_Contactors(CMD_ACTIVATE);
 
-                /* Verify relays actually closed */
+                /* Verify relays actually closed
+                 * (RCD EMI blanking lives inside APP_Verify_Relays_Closed()
+                 * itself now, right after its relay-measurement circuit
+                 * window closes -- see the note there.) */
                 if (!APP_Verify_Relays_Closed(&g_device_status)) {
                     /* At least one relay failed to close — abort charging */
                     APP_Safe_Shutdown();
                     g_nextState = FAULT_RELAY_CONTACT;
                     CP_SetLine_Low();
                     Board_Unlock_Cable(); /* never actually energized -- no reason to stay locked */
-                } else {
-                    /* EMI Blanking: The massive inrush current and contact bouncing
-                     * typically couples into the RCD sensor line and triggers a false EXTI.
-                     * We clear any RCD fault that occurred during the 50ms mechanical closing window.
-                     * Also clear rcd_pending_check: if the EXTI fired during the
-                     * pull-in surge, that flag is still set and would otherwise
-                     * re-confirm RCD_Fault on the very next main-loop pass,
-                     * undoing this blanking immediately after it runs. */
-                    RCD_Fault = 0;
-                    rcd_pending_check = false;
-                    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
                 }
                 break;
 
@@ -883,11 +925,14 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
         		Board_Set_Contactors(CMD_ACTIVATE);
 
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
                 /* EMI Blanking for test command */
                 HAL_Delay(50);
                 RCD_Fault = 0;
                 rcd_pending_check = false;
                 __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+                rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+#endif
 
 				//Send ACK
 				Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
@@ -913,8 +958,25 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         	APP_RS485_Send_Message(&Transmit_frame);
         	break;
 
+        case CMD_RELAY_MEAS_SET:
+        	/* Bench diagnostics only: forces the K1/K4 sense circuits
+        	 * permanently on (payload != 0) or releases the override
+        	 * (payload == 0), so K1/K4 feedback can be probed at will
+        	 * instead of only during a brief verification pulse. */
+        	Board_Force_Relay_Measurement(frame->data_RX[0] != 0);
+
+        	Transmit_frame.dest_ID = ID_MASTER;
+        	Transmit_frame.cmd = CMD_RELAY_MEAS_SET;
+        	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
+        	Transmit_frame.len = 1;
+        	APP_RS485_Send_Message(&Transmit_frame);
+        	break;
+
         case CMD_RELAY_GET:
         {
+        	/* K1/K4 feedback needs its sense circuit powered before reading. */
+        	Board_Enable_Relay_Measurement(CMD_ACTIVATE);
+        	HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
 
         	if(Board_Is_K1_Closed()){
         		g_device_status.relay_state |= RELAY_ERR_K1_CLOSE;
@@ -947,6 +1009,20 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         	else{
         		g_device_status.relay_state &=~RELAY_ERR_K4_CLOSE;
         	}
+
+        	Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
+
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
+        	/* EMI Blanking: same sense-circuit activation as
+        	 * APP_Verify_Relays_Closed/Open() -- clear any RCD fault/pending
+        	 * check picked up during this bench read so it isn't misread as
+        	 * a real residual-current event, and extend the blanking window
+        	 * forward in case the RCD module's pulse starts late. */
+        	RCD_Fault = 0;
+        	rcd_pending_check = false;
+        	__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+        	rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+#endif
 
 			//Send ACK
         	Transmit_frame.dest_ID = ID_MASTER;
@@ -1172,7 +1248,8 @@ void APP_Comms_Task(void) {
                    notify.dest_ID    = ID_MASTER;
                    notify.cmd        = CMD_STATE_NOTIFY;
                    notify.data_RX[0] = (uint8_t)g_CP_STATE; // Reenvia o estado atual
-                   notify.len = 1;
+                   notify.data_RX[1] = g_cable_max_amps;
+                   notify.len = 2;
                    APP_RS485_Send_Message(&notify);
                } else {
                    // Esgotaram-se as tentativas - Declarar perda de comunicação!
@@ -1294,7 +1371,12 @@ static void APP_Safe_Shutdown(void) {
 bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
 
     bool all_ok = false;
-    
+
+    /* K1/K4 feedback needs its sense circuit powered before any of the
+     * reads below (including the polling loop) are valid. */
+    Board_Enable_Relay_Measurement(CMD_ACTIVATE);
+    HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
+
     /* Dynamic Polling (Max 250ms): Sluggish AC Optocouplers or slow mechanical
      * latches take time. We loop every 10ms to check if they have finally closed.
      * We instantly break out of the loop and resume the main program the millisecond
@@ -1349,6 +1431,22 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
     }
 #endif
 
+    Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
+
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
+    /* EMI Blanking: powering the K1/K4 sense circuit for this whole
+     * verification window is what has been observed coupling noise into
+     * the RCD sensor line -- not the contactor coils switching. Clear any
+     * RCD fault/pending-check picked up during it so a routine relay
+     * verification isn't misread as a real residual-current event, and
+     * extend the blanking window forward -- the RCD module's ~60ms pulse
+     * can start with some latency, possibly after this point. */
+    RCD_Fault = 0;
+    rcd_pending_check = false;
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+#endif
+
     return all_ok;
 }
 
@@ -1362,7 +1460,12 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
 bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
 
     bool all_ok = false;
-    
+
+    /* K1/K4 feedback needs its sense circuit powered before any of the
+     * reads below (including the polling loop) are valid. */
+    Board_Enable_Relay_Measurement(CMD_ACTIVATE);
+    HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
+
     /* Dynamic Polling (Max 250ms): When opening, AC sensing Optocouplers
      * have huge smoothing capacitors that can take up to 100~200ms to fully 
      * discharge down to 0V. We poll every 10ms until they all report OPEN.
@@ -1412,6 +1515,22 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
         status->relay_errors |= RELAY_ERR_K4_OPEN;
         all_ok = false;
     }
+#endif
+
+    Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
+
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
+    /* EMI Blanking: powering the K1/K4 sense circuit for this whole
+     * verification window is what has been observed coupling noise into
+     * the RCD sensor line -- not the contactor coils switching. Clear any
+     * RCD fault/pending-check picked up during it so a routine relay
+     * verification isn't misread as a real residual-current event, and
+     * extend the blanking window forward -- the RCD module's ~60ms pulse
+     * can start with some latency, possibly after this point. */
+    RCD_Fault = 0;
+    rcd_pending_check = false;
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
 #endif
 
     return all_ok;

@@ -37,6 +37,23 @@ static volatile uint16_t rx_tail_index = 0;
  */
 static volatile bool rs485_busy	=	false;
 
+/**
+ * @brief  Tick (HAL_GetTick()) when the current transmission started.
+ * @note   rs485_busy is only ever cleared by HAL_UART_TxCpltCallback(). If a
+ *         transmission is corrupted mid-flight (bus noise/glitch -- e.g.
+ *         observed right after cutting mains power to the charger) and that
+ *         callback never fires, rs485_busy would otherwise stay stuck true
+ *         forever, silently dropping every future response until a manual
+ *         reset. This timestamp lets RS485_Send_Package() detect that and
+ *         force-recover instead.
+ */
+static volatile uint32_t rs485_tx_start_tick = 0;
+
+/** Generous timeout for the largest frame this protocol ever sends
+ * (~15 bytes) at 115200 baud (~1.3ms) -- anything still "busy" this long
+ * after starting is stuck, not just slow. */
+#define RS485_TX_TIMEOUT_MS  50u
+
 
 /* ============================================================================== */
 /* RS-485 FUNCTIONS                                                               */
@@ -75,11 +92,22 @@ void RS485_Send_Package(uint8_t* data, uint16_t length)
     /* Safety Check: Prevent overwriting an ongoing transmission */
     if(rs485_busy == true)
     {
-        /* Optional: Implement a software TX Queue here if needed later */
-        return;
+        if ((HAL_GetTick() - rs485_tx_start_tick) < RS485_TX_TIMEOUT_MS)
+        {
+            /* Optional: Implement a software TX Queue here if needed later */
+            return;
+        }
+
+        /* Stuck: the previous transmission's HAL_UART_TxCpltCallback never
+         * fired (corrupted mid-flight). Force the UART/DMA back to idle and
+         * recover instead of dropping every response forever. */
+        HAL_UART_AbortTransmit(&huart2);
+        Board_Set_RS485_DE(RECEIVER);
+        rs485_busy = false;
     }
 
     rs485_busy = true;
+    rs485_tx_start_tick = HAL_GetTick();
 
     /* 1. Enable Driver (Talk Mode) */
     Board_Set_RS485_DE(SEND);

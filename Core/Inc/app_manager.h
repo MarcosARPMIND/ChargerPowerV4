@@ -62,6 +62,7 @@
 #define CMD_LOCK_SET        0x62  // Lock / unlock cable actuator
 #define CMD_LOCK_GET        0x63  // Get cable lock state
 #define CMD_RELAY_RESET     0x64  // Set contactor / relay state
+#define CMD_RELAY_MEAS_SET  0x65  // Force K1/K4 relay measurement circuit permanently on/off (bench diagnostics)
 
 // --- Heartbeat / ACK ---
 #define CMD_HEARTBEAT       0x70  // Ping / alive check
@@ -121,6 +122,15 @@
  * Typical mechanical relays need 5-20ms to fully commute.
  */
 #define RELAY_SETTLING_TIME_MS  50
+
+/**
+ * @brief Settling time (ms) after Board_Enable_Relay_Measurement(CMD_ACTIVATE)
+ * before the K1/K4 sense circuit's reading is valid.
+ * @note 5ms (initial estimate) was too short -- repeated CMD_RELAY_GET
+ * queries showed K4 flickering between closed/open on the same physical
+ * state. 50ms confirmed stable on real hardware; 30ms kept as margin.
+ */
+#define RELAY_MEAS_ENABLE_SETTLING_MS  50
 
 /**
  * @brief Relay Error Bitmask Layout (uint8_t relay_errors)

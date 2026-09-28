@@ -53,24 +53,60 @@
  *             PP_Classify_Voltage() and PP_Rating_To_Amps() from the build.
  * @where_used cp.h / cp.c (PP_* functions), main.c (bring-up test readout).
  */
-#define ENABLE_PP_SENSE             0
+#define ENABLE_PP_SENSE             1
 
 /* ============================================================================== */
 /* TEMPORARY HARDWARE WORKAROUNDS                                                 */
 /* ============================================================================== */
 
 /**
- * @brief TEMPORARY: ignore the K4 relay feedback pin (PB0 / RELAY_STATE_4).
- * @values 1 = PB0 reads permanently HIGH regardless of the actual relay
- *             state (suspected hardware fault, same symptom observed on
- *             PA6/K2). K4 is excluded from the pre-charge weld check and
- *             from APP_Verify_Relays_Closed()/Open() -- the same way K2/K3
- *             are already excluded under SYSTEM_PHASES=1. This does NOT
- *             stop K4 from being driven, only stops trusting its feedback.
+ * @brief Ignore the K4 relay feedback pin (PB0 / RELAY_STATE_4).
+ * @values 1 = PB0 read as permanently HIGH regardless of the actual relay
+ *             state. Root cause found: K1/K4 feedback needs its sense
+ *             circuit powered via Board_Enable_Relay_Measurement() (see
+ *             board_io.c) before the reading is valid -- it wasn't being
+ *             activated at all, not a hardware fault. K4 is excluded from
+ *             Relay Verification Activation and APP_Verify_Relays_Closed()/
+ *             Open() -- the same way K2/K3 are already excluded under
+ *             SYSTEM_PHASES=1. This does NOT stop K4 from being driven,
+ *             only stops trusting its feedback.
  *         0 = Normal behaviour, K4 feedback trusted like any other relay.
- * @where_used app_manager.c: CHARGING entry weld check, APP_Verify_Relays_*().
- * @todo   Set back to 0 once PB0 is fixed/confirmed on hardware.
+ *             Now that the measurement-circuit activation is wired in
+ *             everywhere K1/K4 are read, K4's feedback is trusted again.
+ * @where_used app_manager.c: Relay Verification Activation, APP_Verify_Relays_*().
  */
-#define IGNORE_K4_FEEDBACK          1
+#define IGNORE_K4_FEEDBACK          0
+
+/**
+ * @brief Bench-test override for the K2 (phase 2) weld detector.
+ * @values 1 = Board_Is_K2_Closed() reads K2_WELD_TEST_PIN (PA10, ex I2C1_SDA,
+ *             STM pin 32) instead of the normal RELAY_STATE_2 (PA6). Stand-in
+ *             wiring while the phase-2 weld-detector hardware fix is pending.
+ *         0 = Normal behaviour, K2 read from RELAY_STATE_2 (PA6) as usual.
+ *             Revert to this once the hardware fix lands.
+ * @where_used board_io.c: Board_Is_K2_Closed().
+ */
+#define K2_WELD_TEST_OVERRIDE       1
+
+/* ============================================================================== */
+/* RCD NUISANCE-TRIP MITIGATION                                                   */
+/* ============================================================================== */
+
+/**
+ * @brief Suppress RCD_Fault confirmation around K1/K4 relay-verification reads.
+ * @values 1 = Every point that powers the K1/K4 measurement-circuit sense line
+ *             (Relay Verification Activation, APP_Verify_Relays_Closed/Open,
+ *             CMD_RELAY_GET, CMD_RELAY_SET test path) clears RCD_Fault/
+ *             rcd_pending_check and opens a rcd_blank_until_tick window
+ *             (main.c) afterwards, since that activation has been observed
+ *             coupling a ~60ms pulse into the RCD sensor line that is not a
+ *             real residual-current event.
+ *         0 = No suppression anywhere -- every RCD trip (real or induced by
+ *             the sense-circuit activation) is confirmed and reaches
+ *             FAULT_RCD normally. Set to 0 to bench-test whether the
+ *             nuisance trip still happens without any mitigation in the way.
+ * @where_used app_manager.c (the 5 blanking sites), main.c (debounce block).
+ */
+#define RCD_BLANK_DURING_RELAY_VERIFICATION   0
 
 #endif /* INC_FEATURE_CONFIG_H_ */

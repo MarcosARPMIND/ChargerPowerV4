@@ -58,5 +58,15 @@ bool Board_Is_K2_Closed(void);
 bool Board_Is_K3_Closed(void);
 bool Board_Is_K4_Closed(void);
 
+/* K1/K4 feedback needs their sense circuit powered before the reading is
+ * valid -- CMD_ACTIVATE enables both, CMD_DEACTIVATE disables both. Call
+ * before reading Board_Is_K1_Closed()/Board_Is_K4_Closed() (after the
+ * settling delay), and disable again once done reading. */
+void Board_Enable_Relay_Measurement(PIN_STATE state);
+
+/* Bench diagnostics: force the K1/K4 measurement circuits permanently on
+ * (or release the override) via the Master -- see CMD_RELAY_MEAS_SET. */
+void Board_Force_Relay_Measurement(bool force_on);
+
 
 #endif /* INC_BOARD_IO_H_ */

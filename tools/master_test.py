@@ -88,6 +88,7 @@ CMD_RELAY_GET = 0x61
 CMD_LOCK_SET = 0x62
 CMD_LOCK_GET = 0x63
 CMD_RELAY_RESET = 0x64
+CMD_RELAY_MEAS_SET = 0x65
 
 CMD_HEARTBEAT = 0x70
 CMD_ACK = 0xF0
@@ -188,6 +189,11 @@ class RS485Link:
         self.ser = serial.Serial(port, baud, timeout=0.05)
         self.rx_buf = bytearray()
         self.responses = queue.Queue()
+        # send() toggles the DE pin and writes the serial port -- it's called
+        # both from the main thread (user commands) and from _reader_loop
+        # (auto-ACK on CMD_STATE_NOTIFY). Without this lock, two overlapping
+        # sends interleave on the wire and corrupt each other's frame.
+        self.send_lock = threading.Lock()
         self.stop_flag = threading.Event()
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.on_state_notify = None  # callback(cp_state:int)
@@ -212,13 +218,14 @@ class RS485Link:
         frame = build_frame(ID_CHARGER, cmd, data)
         if self.verbose_raw:
             print(f"[TX] {frame.hex(' ')}")
-        lgpio.gpio_write(self.gpio_h, self.de_pin, 1)  # transmit
-        try:
-            self.ser.write(frame)
-            self.ser.flush()  # tcdrain() -- blocks until physically transmitted
-            time.sleep(self._DE_TURNAROUND_S)
-        finally:
-            lgpio.gpio_write(self.gpio_h, self.de_pin, 0)  # back to receive
+        with self.send_lock:
+            lgpio.gpio_write(self.gpio_h, self.de_pin, 1)  # transmit
+            try:
+                self.ser.write(frame)
+                self.ser.flush()  # tcdrain() -- blocks until physically transmitted
+                time.sleep(self._DE_TURNAROUND_S)
+            finally:
+                lgpio.gpio_write(self.gpio_h, self.de_pin, 0)  # back to receive
 
     def _reader_loop(self):
         while not self.stop_flag.is_set():
@@ -268,7 +275,14 @@ class RS485Link:
         if cmd == CMD_STATE_NOTIFY and len(data) >= 1 and data[0] != CMD_ACK:
             cp_state = data[0]
             name = CP_STATE_NAMES.get(cp_state, f"0x{cp_state:02X}")
-            print(f"\n>>> MUDANCA DE ESTADO CP: {name}")
+            # data[1] = corrente maxima do cabo (PP), em Amps -- 0 = desconhecida/sem cabo.
+            # So presente em firmware com ENABLE_PP_SENSE; len(data)==1 em firmware antigo.
+            if len(data) >= 2:
+                cable_amps = data[1]
+                cable_str = f"{cable_amps}A" if cable_amps > 0 else "desconhecida"
+                print(f"\n>>> MUDANCA DE ESTADO CP: {name}  (cabo: {cable_str})")
+            else:
+                print(f"\n>>> MUDANCA DE ESTADO CP: {name}")
             if self.on_state_notify:
                 self.on_state_notify(cp_state)
             # Confirma ao firmware para nao ficar a retransmitir/repetir
@@ -392,6 +406,22 @@ def cmd_relay_raw(link, activate):
             print(f"Resposta inesperada: {data.hex(' ')}")
 
 
+def cmd_relay_meas(link, force_on):
+    """CMD_RELAY_MEAS_SET -- forca os circuitos de medicao do K1/K4 a ficarem
+    sempre ativos (em vez de so um pulso breve durante cada verificacao),
+    para poder sondar RELAY_STATE_1/4 (PB1/PB0) com multimetro/osciloscopio
+    a vontade. So para diagnostico de bancada -- lembra-te de desligar
+    ('meas off') no fim, para nao ficar ligado desnecessariamente."""
+    data = link.request(CMD_RELAY_MEAS_SET, bytes([1 if force_on else 0]))
+    if data is None:
+        print("Sem resposta (timeout).")
+    elif data[0] == CMD_ACK:
+        print("Circuito de medicao K1/K4 sempre ativo (ACK)." if force_on
+              else "Circuito de medicao K1/K4 libertado, volta ao normal (ACK).")
+    else:
+        print(f"Resposta inesperada: {data.hex(' ')}")
+
+
 def cmd_clear_faults(link):
     data = link.request(CMD_CLEAR_FAULTS)
     if data:
@@ -439,6 +469,8 @@ Comandos disponiveis:
   relays | r          Estado ao vivo dos contactores K1..K4 (CMD_RELAY_GET)
   relay on|off        Atua os contactores DIRETAMENTE (so teste de bancada,
                       sem veiculo -- salta lock/weld-check/verificacao)
+  meas on|off         Forca o circuito de medicao do K1/K4 sempre ativo,
+                      para sondar RELAY_STATE_1/4 (PB1/PB0) a vontade
   clear               Limpa falhas (CMD_CLEAR_FAULTS)
   ping                Heartbeat
   raw on|off          Mostra/esconde os bytes TX/RX crus
@@ -512,6 +544,11 @@ def main():
                     print("Uso: relay on|off")
                     continue
                 cmd_relay_raw(link, parts[1].lower() == "on")
+            elif op == "meas":
+                if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+                    print("Uso: meas on|off")
+                    continue
+                cmd_relay_meas(link, parts[1].lower() == "on")
             elif op == "clear":
                 cmd_clear_faults(link)
             elif op == "ping":

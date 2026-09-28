@@ -7,6 +7,7 @@
 
 
 #include "board_io.h"
+#include "feature_config.h"
 #include "stm32c0xx_hal.h"
 #include "stm32c0xx_hal_gpio.h"
 
@@ -275,9 +276,17 @@ bool Board_Is_K1_Closed(void){
 /**
  * @brief  Reads the physical state of Contactor K2 (Mirror Contact).
  * @return true if Closed (Conducting), false if Open.
+ * @note   K2_WELD_TEST_OVERRIDE (feature_config.h): TEMPORARY bench-test
+ *         wiring reads from K2_WELD_TEST_PIN (PA10, ex I2C1_SDA) instead of
+ *         the normal RELAY_STATE_2 (PA6), while the phase-2 weld-detector
+ *         hardware fix is pending. Revert once that lands.
  */
 bool Board_Is_K2_Closed(void){
+#if K2_WELD_TEST_OVERRIDE
+	return (HAL_GPIO_ReadPin(K2_WELD_TEST_PORT,K2_WELD_TEST_PIN) == GPIO_PIN_SET);
+#else
 	return (HAL_GPIO_ReadPin(RELAY_STATE_2_PORT,RELAY_STATE_2_PIN) == GPIO_PIN_SET);
+#endif
 }
 /**
  * @brief  Reads the physical state of Contactor K3 (Mirror Contact).
@@ -292,4 +301,47 @@ bool Board_Is_K3_Closed(void){
  */
 bool Board_Is_K4_Closed(void){
 	return (HAL_GPIO_ReadPin(RELAY_STATE_4_PORT,RELAY_STATE_4_PIN) == GPIO_PIN_SET);
+}
+
+/* When set, Board_Enable_Relay_Measurement(CMD_DEACTIVATE) is ignored --
+ * lets the Master force the K1/K4 sense circuits permanently on for bench
+ * diagnostics (e.g. probing RELAY_STATE_1/4 freely), instead of them only
+ * being briefly pulsed on during each verification. See
+ * Board_Force_Relay_Measurement() / CMD_RELAY_MEAS_SET. */
+static bool relay_measurement_forced_on = false;
+
+/**
+ * @brief  Enables/disables the K1/K4 relay-feedback sense circuit.
+ * @param  state CMD_ACTIVATE (power the sense circuit, active HIGH) or
+ *               CMD_DEACTIVATE (power it down).
+ * @note   Hardware revision: a single enable line now powers both the K1 and
+ *         K4 sense circuits, so only K1_MEAS_ENABLE_PIN is driven.
+ *         K4_MEAS_ENABLE_PIN (PA10, ex-I2C1_SDA) is left unused/inactive --
+ *         kept configured in gpio.c but never written -- in case a future
+ *         revision needs it back.
+ * @note   CMD_DEACTIVATE is a no-op while forced on (see
+ *         Board_Force_Relay_Measurement()) -- callers don't need to know
+ *         or care that a bench-diagnostics override is active.
+ */
+void Board_Enable_Relay_Measurement(PIN_STATE state){
+	if (relay_measurement_forced_on && state == CMD_DEACTIVATE) {
+		return;
+	}
+	GPIO_PinState pin_state = (state == CMD_ACTIVATE) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+	HAL_GPIO_WritePin(K1_MEAS_ENABLE_PORT, K1_MEAS_ENABLE_PIN, pin_state);
+}
+
+/**
+ * @brief  Forces the K1/K4 measurement circuits permanently on (or releases
+ *         the override), for bench diagnostics via the Master.
+ * @param  force_on true = turn on now and keep on regardless of any
+ *                   subsequent Board_Enable_Relay_Measurement(CMD_DEACTIVATE)
+ *                   call from a verification routine.
+ *                   false = release the override and turn back off
+ *                   immediately (no verification is ever mid-flight across
+ *                   an RS485 command, so it's safe to deactivate here).
+ */
+void Board_Force_Relay_Measurement(bool force_on){
+	relay_measurement_forced_on = force_on;
+	Board_Enable_Relay_Measurement(force_on ? CMD_ACTIVATE : CMD_DEACTIVATE);
 }

@@ -68,6 +68,17 @@ extern volatile uint8_t RCD_Fault;
 volatile uint32_t rcd_trigger_time  = 0;
 volatile bool     rcd_pending_check = false;
 
+/* RCD Blanking Window (non-static: set from app_manager.c's relay
+ * verification routines). Bench testing found the RCD module's fault
+ * pulse can start with some latency relative to the K1/K4 sense-circuit
+ * activation edge -- and lasts ~60ms -- so clearing RCD_Fault/rcd_pending_check
+ * only once, right when the verification window closes, isn't reliable:
+ * the pulse can still be in flight, or hasn't even started yet, at that
+ * exact instant. This timestamp instead suppresses *any* confirmation
+ * (see the debounce block below) until well after it, regardless of when
+ * exactly within the window the pulse actually occurs. */
+volatile uint32_t rcd_blank_until_tick = 0;
+
 STATE_MACHINE currentState = IDLE;
 
 
@@ -102,6 +113,14 @@ volatile bool diag_k1_before, diag_k2_before, diag_k3_before, diag_k4_before;
 volatile bool diag_k1_closed, diag_k2_closed, diag_k3_closed, diag_k4_closed;
 volatile bool diag_k1_after,  diag_k2_after,  diag_k3_after,  diag_k4_after;
 
+/* TEMP: same "closed" read as diag_k1/k4_closed above, but taken ~2s later
+ * instead of ~250ms after commanding the relay closed -- isolates whether
+ * the K1/K4 measurement circuit just needs longer than expected to settle
+ * (if these read true while diag_k1/k4_closed above read false, it's a
+ * timing issue, not a wiring/logic one). Remove once settling time is
+ * confirmed and RELAY_MEAS_ENABLE_SETTLING_MS is set accordingly. */
+volatile bool diag_k1_closed_slow, diag_k4_closed_slow;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,8 +140,7 @@ void SystemClock_Config(void);
   * @brief  The application entry point.
   * @retval int
   */
-int main(void)
-{
+int main(void){
 
   /* USER CODE BEGIN 1 */
 
@@ -154,8 +172,12 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM14_Init();
   MX_TIM17_Init();
-  //MX_IWDG_Init();
-  MX_I2C1_Init();
+  MX_IWDG_Init(); /* ~8.2s timeout (Prescaler/64, Reload 4095, LSI~32kHz) -- see iwdg.c */
+  /* I2C1 disabled: PA9/PA10 (SCL/SDA) are now the K1/K4 relay
+   * measurement-circuit enable lines -- see K1/K4_MEAS_ENABLE_PIN in
+   * app_config.h. The temperature sensor this bus was reserved for was
+   * never implemented. */
+  //MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
@@ -201,7 +223,14 @@ int main(void)
 
   CP_SetLine_High();
 
-  // /* --- Relay feedback diagnostic (temporary) --- */
+  /* --- Relay feedback diagnostic (temporary) ---
+   * K1/K4 sense circuits need Board_Enable_Relay_Measurement(CMD_ACTIVATE)
+   * before their reading means anything (see board_io.c) -- enabled once
+   * for this whole one-shot boot sequence, disabled again at the end. */
+
+  // Board_Enable_Relay_Measurement(CMD_ACTIVATE);
+  // HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
+
   // Board_Set_Contactors(CMD_DEACTIVATE);   /* baseline: force open first */
   // HAL_Delay(100);
   // diag_k1_before = Board_Is_K1_Closed();
@@ -216,12 +245,22 @@ int main(void)
   // diag_k3_closed = Board_Is_K3_Closed();
   // diag_k4_closed = Board_Is_K4_Closed();
 
-  // Board_Set_Contactors(CMD_DEACTIVATE);   /* open again -- don't leave energized */
-  // HAL_Delay(300);                          /* let AC optocouplers discharge, same margin as APP_Verify_Relays_Open() */
-  // diag_k1_after = Board_Is_K1_Closed();
-  // diag_k2_after = Board_Is_K2_Closed();
-  // diag_k3_after = Board_Is_K3_Closed();
-  // diag_k4_after = Board_Is_K4_Closed();
+
+  // Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
+
+  // diag_k1_closed = Board_Is_K1_Closed();
+  // diag_k2_closed = Board_Is_K2_Closed();
+  // diag_k3_closed = Board_Is_K3_Closed();
+  // diag_k4_closed = Board_Is_K4_Closed();
+
+  // Board_Set_Contactors(CMD_DEACTIVATE); 
+
+  // diag_k1_closed = Board_Is_K1_Closed();
+  // diag_k2_closed = Board_Is_K2_Closed();
+  // diag_k3_closed = Board_Is_K3_Closed();
+  // diag_k4_closed = Board_Is_K4_Closed();
+
+
 
   /* USER CODE END 2 */
 
@@ -246,11 +285,21 @@ int main(void)
 
 
       // 0. RCD Debounce Validation
+#if RCD_BLANK_DURING_RELAY_VERIFICATION
+      if (rcd_pending_check && HAL_GetTick() < rcd_blank_until_tick) {
+          /* Still inside a relay-verification blanking window (see
+           * rcd_blank_until_tick) -- this edge is attributable to the K1/K4
+           * sense-circuit activation, not a real residual-current event. */
+          rcd_pending_check = false;
+      }
+#endif
       if (rcd_pending_check) {
           if ((HAL_GetTick() - rcd_trigger_time) >= RCD_DEBOUNCE_MS) {
-              /* Debounce window elapsed — re-read the physical pin */
-              if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
-                  /* Pin still HIGH after 30ms → confirmed real RCD fault */
+              /* Debounce window elapsed — re-read the physical pin.
+               * RCD module output is open-collector: idle/OK = pulled HIGH,
+               * tripped = pulled LOW (0V). */
+              if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
+                  /* Pin still LOW after RCD_DEBOUNCE_MS → confirmed real RCD fault */
                   RCD_Fault = 1;
               }
               rcd_pending_check = false;
@@ -263,14 +312,14 @@ int main(void)
        * FAULT_RCD. No need to react to it here too. */
 
 
-      HAL_Delay(100);
+      HAL_Delay(5);
 
       // --- Normal operation (disabled during bring-up test) ---
        APP_Comms_Task();
        APP_MAIN(&currentState);
        APP_Energy_Task();
 
-  //    HAL_IWDG_Refresh(&hiwdg);
+      HAL_IWDG_Refresh(&hiwdg);
 
 
   }
