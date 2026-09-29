@@ -152,16 +152,13 @@ void Board_Set_RS485_DE(DE_STATE state){
 	}
 
 }
-/* Relay-coil MOSFET economizer duty cycle (0-1000 = 0.0%-100.0%) on PC7/TIM3_CH2 */
-#define RELAY_PULLIN_DUTY_PERMILLE   1000    /* 100% — full force to pull the armature in */
-#define RELAY_HOLD_DUTY_PERMILLE     300     /* 30%  — reduced current once contact is closed */
-#define RELAY_PULLIN_TIME_MS        150      /* Blind pull-in window before dropping to hold duty */
-
 /**
  * @brief  Sets the PWM duty driving the relay-coil MOSFET (PC7 / TIM3_CH2).
  * @param  duty_permille 0-1000 (0.0% to 100.0%), clamped.
+ * @note   Normal code goes through Board_Set_Contactors() (pull-in, then hold).
+ *         Public only for the economizer bench test in main.c.
  */
-static void Board_Set_Relay_Coil_Duty(uint16_t duty_permille){
+void Board_Set_Relay_Coil_Duty(uint16_t duty_permille){
 	if (duty_permille > 1000) { duty_permille = 1000; }
 
 	uint32_t period_ticks = TIM3->ARR + 1;

@@ -78,30 +78,16 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA6 PA7 -- K2/K3 relay feedback (RELAY_STATE_2/3)
-     Pull-down: an open contact must read a clean LOW, not float and pick up
-     noise (see relay-feedback investigation -- false "closed" readings). */
+  /*Configure GPIO pins : PA6 PA7 */
   GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 -- K4/K1 relay feedback (RELAY_STATE_4/1)
-     Pull-down for the same reason as PA6/PA7 above. K4 feedback is still
-     ignored in software (IGNORE_K4_FEEDBACK, feature_config.h) since PB0
-     reads permanently HIGH regardless of pull config -- not a floating-pin
-     issue on that one, but the pull-down stays for consistency. */
+  /*Configure GPIO pins : PB0 PB1 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : cable_lock_Pin button_2_ext_Pin
-                           PB12 PB13 PB14 button_1_ext_Pin */
-  GPIO_InitStruct.Pin = cable_lock_Pin|button_2_ext_Pin
-                          |GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|button_1_ext_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : general_LED_Pin */
@@ -110,6 +96,14 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(general_LED_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : cable_lock_Pin button_2_ext_Pin PB12 PB13
+                           PB14 button_1_ext_Pin */
+  GPIO_InitStruct.Pin = cable_lock_Pin|button_2_ext_Pin|GPIO_PIN_12|GPIO_PIN_13
+                          |GPIO_PIN_14|button_1_ext_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : h_bridge_1_Pin */
   GPIO_InitStruct.Pin = h_bridge_1_Pin;
@@ -125,9 +119,7 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : os_temp_Pin -- LM75B OS output (open-drain, active LOW)
-     Pull-up: OS only ever sinks, so without one the line floats while inactive.
-     Harmless in parallel with an external pull-up if the PCB has one. */
+  /*Configure GPIO pin : os_temp_Pin */
   GPIO_InitStruct.Pin = os_temp_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;

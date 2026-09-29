@@ -59,7 +59,7 @@ void CP_SetDuty(uint16_t duty)
     /* 2. Timer Resolution: Dynamically retrieve the total period (ARR + 1).
      * This ensures the duty cycle remains accurate even if the PWM
      * frequency or clock configuration is modified. */
-    uint32_t period_ticks = TIM3->ARR + 1;
+    uint32_t period_ticks = TIM1->ARR + 1;
 
     /* 3. Fixed-Point Optimization (Bit-Shift Logic):
      * Goal: Calculate (duty * period_ticks) / 1000.
@@ -70,7 +70,7 @@ void CP_SetDuty(uint16_t duty)
      * the multiplication (duty * period_ticks * 131), which can exceed
      * the 4.2 billion limit of a 32-bit integer.
      */
-    TIM3->CCR3 = (uint32_t)( ((uint64_t)duty * period_ticks * 131) >> 17 );
+    TIM1->CCR1 = (uint32_t)( ((uint64_t)duty * period_ticks * 131) >> 17 );
 }
 
 /**
@@ -81,7 +81,7 @@ void CP_SetDuty(uint16_t duty)
  */
 void CP_SetLine_High(void)
 {
-    TIM3->CCR3 = TIM3->ARR + 1;
+    TIM1->CCR1 = TIM1->ARR + 1;
 }
 
 /**
@@ -90,7 +90,7 @@ void CP_SetLine_High(void)
  */
 void CP_SetLine_Low(void)
 {
-    TIM3->CCR3 = 0;
+    TIM1->CCR1 = 0;
 }
 
 /**

@@ -582,7 +582,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
      * Kept here, not in the dispatcher, so CP hardware is only ever
      * touched from this function (see Section 2 above). */
     if (g_duty_dirty && (g_nextState == READY || g_nextState == CHARGING)) {
-        /* duty==0 must NOT go through CP_SetDuty(): with CCR3=0 that is
+        /* duty==0 must NOT go through CP_SetDuty(): with CCR1=0 that is
          * electrically identical to CP_SetLine_Low(), which reads back as
          * STATE_F (fault) -- not "no current offered, EV still connected".
          * Matches the same duty>0/else split already used in the READY

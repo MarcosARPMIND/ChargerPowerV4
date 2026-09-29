@@ -39,7 +39,13 @@ void Board_Set_SPI_CS_3(PIN_STATE state);
 
 void Board_Set_RS485_DE(DE_STATE state);
 
+/* Relay-coil MOSFET economizer duty cycle (0-1000 = 0.0%-100.0%) on PC7/TIM3_CH2 */
+#define RELAY_PULLIN_DUTY_PERMILLE   1000    /* 100% — full force to pull the armature in */
+#define RELAY_HOLD_DUTY_PERMILLE     300     /* 30%  — reduced current once contact is closed */
+#define RELAY_PULLIN_TIME_MS        150      /* Blind pull-in window before dropping to hold duty */
+
 void Board_Set_Contactors(PIN_STATE state);
+void Board_Set_Relay_Coil_Duty(uint16_t duty_permille);
 
 void Board_Set_Actuator(ACTUATOR_STATE state);
 

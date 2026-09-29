@@ -106,6 +106,9 @@
 #define ADE_EXTI_PIN                GPIO_PIN_1      /* Configured via NVIC in CubeMX */
 
 /* --- Temperature Sensor (I2C, over I2C1_SCL/SDA above) --- */
+/* LM75B OS output: open-drain, active LOW. Internal pull-up (set in the .ioc):
+ * OS only ever sinks, so without one the line floats while inactive.
+ * Harmless in parallel with an external pull-up if the PCB has one. */
 #define TEMP_SENSOR_ALERT_PORT      GPIOD
 #define TEMP_SENSOR_ALERT_PIN       GPIO_PIN_1      /* Input: alert/interrupt line from the I2C temperature sensor */
 
@@ -124,9 +127,21 @@
 #define RELAYS_PORT 				GPIOC
 #define RELAYS_PIN  				GPIO_PIN_7      /* Contactor K3 Command (Phase 3) */
 
+/* --- PWM TIMERS --- */
+/* Note: configured via CubeMX (.ioc). Defined here for context only.
+ * Separate timers so each signal gets its own frequency. */
+/* PA8 / TIM1_CH1: Control Pilot, 1 kHz (IEC 61851), driven by cp.c */
+/* PC7 / TIM3_CH2: relay-coil MOSFET economizer, 20 kHz (above audible), driven by board_io.c */
+
 
 /* --- RELAY FEEDBACK (Inputs) --- */
 /* Mirror contacts to verify physical state of relays (Safety monitoring) */
+/* Pull-down on all four (set in the .ioc): an open contact must read a clean
+ * LOW, not float and pick up noise (see relay-feedback investigation -- false
+ * "closed" readings). K4 feedback (PB0) is still ignored in software
+ * (IGNORE_K4_FEEDBACK, feature_config.h) since it reads permanently HIGH
+ * regardless of pull config -- not a floating-pin issue on that one, but the
+ * pull-down stays for consistency. */
 
 #define RELAY_STATE_1_PORT          GPIOB
 #define RELAY_STATE_1_PIN           GPIO_PIN_1      /* Feedback from K1 (Phase 1) */
