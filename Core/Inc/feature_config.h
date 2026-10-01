@@ -51,31 +51,38 @@
  *             fixed/hardcoded (e.g. via CMD_SET_CURRENT or a hardware constant)
  *             and this mechanism is skipped entirely; removes PP_Read_mV(),
  *             PP_Classify_Voltage() and PP_Rating_To_Amps() from the build.
- * @where_used cp.h / cp.c (PP_* functions), main.c (bring-up test readout).
+ * @where_used cp.h / cp.c (PP_* functions), app_manager.c (IDLE: PP read on connect).
  */
 #define ENABLE_PP_SENSE             1
 
 /* ============================================================================== */
-/* TEMPORARY HARDWARE WORKAROUNDS                                                 */
+/* RELAY VERIFICATION                                                             */
 /* ============================================================================== */
 
 /**
- * @brief Ignore the K4 relay feedback pin (PB0 / RELAY_STATE_4).
- * @values 1 = PB0 read as permanently HIGH regardless of the actual relay
- *             state. Root cause found: K1/K4 feedback needs its sense
- *             circuit powered via Board_Enable_Relay_Measurement() (see
- *             board_io.c) before the reading is valid -- it wasn't being
- *             activated at all, not a hardware fault. K4 is excluded from
- *             Relay Verification Activation and APP_Verify_Relays_Closed()/
- *             Open() -- the same way K2/K3 are already excluded under
- *             SYSTEM_PHASES=1. This does NOT stop K4 from being driven,
- *             only stops trusting its feedback.
- *         0 = Normal behaviour, K4 feedback trusted like any other relay.
- *             Now that the measurement-circuit activation is wired in
- *             everywhere K1/K4 are read, K4's feedback is trusted again.
- * @where_used app_manager.c: Relay Verification Activation, APP_Verify_Relays_*().
+ * @brief Relay contact verification (weld / failed-to-close detection).
+ * @values 1 = Normal behaviour. The K1/K4 sense circuit is powered and the
+ *             feedback read at three points: before closing (pre-charge weld
+ *             check), after closing (APP_Verify_Relays_Closed) and after
+ *             opening (APP_Verify_Relays_Open). Any mismatch ->
+ *             FAULT_RELAY_CONTACT. K2/K3 only with SYSTEM_PHASES == 3.
+ *         0 = BENCH ONLY. None of those checks run and the sense circuit is
+ *             never powered automatically; relays are still driven normally
+ *             and CMD_RELAY_GET still reads them on demand. A welded contact
+ *             goes UNDETECTED (connector stays live after the session) --
+ *             app_manager.c emits a #warning so this can't slip into a
+ *             release build unnoticed.
+ * @note   The K4 feedback workaround (IGNORE_K4_FEEDBACK) is gone: its root
+ *         cause was the sense circuit not being powered, now fixed, so K4 is
+ *         always verified like K1.
+ * @where_used app_manager.c: CHARGING entry (pre-charge check),
+ *             APP_Verify_Relays_Closed(), APP_Verify_Relays_Open().
  */
-#define IGNORE_K4_FEEDBACK          0
+#define ENABLE_RELAY_VERIFICATION   1
+
+/* ============================================================================== */
+/* TEMPORARY HARDWARE WORKAROUNDS                                                 */
+/* ============================================================================== */
 
 /**
  * @brief Bench-test override for the K2 (phase 2) weld detector.
@@ -96,16 +103,16 @@
  * @brief Suppress RCD_Fault confirmation around K1/K4 relay-verification reads.
  * @values 1 = Every point that powers the K1/K4 measurement-circuit sense line
  *             (Relay Verification Activation, APP_Verify_Relays_Closed/Open,
- *             CMD_RELAY_GET, CMD_RELAY_SET test path) clears RCD_Fault/
- *             rcd_pending_check and opens a rcd_blank_until_tick window
- *             (main.c) afterwards, since that activation has been observed
+ *             CMD_RELAY_GET, CMD_RELAY_SET test path) revokes any RCD trip
+ *             and opens a blanking window afterwards (RCD_Monitor_Blank(),
+ *             rcd_monitor.c), since that activation has been observed
  *             coupling a ~60ms pulse into the RCD sensor line that is not a
  *             real residual-current event.
  *         0 = No suppression anywhere -- every RCD trip (real or induced by
  *             the sense-circuit activation) is confirmed and reaches
  *             FAULT_RCD normally. Set to 0 to bench-test whether the
  *             nuisance trip still happens without any mitigation in the way.
- * @where_used app_manager.c (the 5 blanking sites), main.c (debounce block).
+ * @where_used app_manager.c (the 5 blanking sites).
  */
 #define RCD_BLANK_DURING_RELAY_VERIFICATION   0
 

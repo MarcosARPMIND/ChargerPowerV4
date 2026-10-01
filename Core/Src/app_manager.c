@@ -8,27 +8,28 @@
 
 #include "app_manager.h"
 
+#if !ENABLE_RELAY_VERIFICATION
+#warning "ENABLE_RELAY_VERIFICATION = 0: welded / failed-to-close contacts are NOT detected -- bench builds only"
+#endif
 
-static uint16_t counter = 0;
-
-// File-scope state: accessible to all functions in this translation unit,
-// but invisible outside app_manager.c (encapsulation via 'static').
+/* File-scope state: shared by the functions in this file, invisible outside it */
 static STATE_MACHINE g_nextState = IDLE;
 static CP_State      g_CP_STATE  = STATE_A;
 
 static CP_State      g_CP_LAST_STATE = STATE_A;
 
 /* ── CP State Debounce Filter ──────────────────────────────────────────────
- * Problem: CP_GetState() is called every main-loop cycle (~1-2 ms). A single
- * corrupted ADC sample (EMI spike, DMA wrap-around mid-buffer) can produce a
- * momentary STATE_F or STATE_UNKNOWN, which would fire FAULT_CAR immediately.
+ * Problem: CP_GetState() is called on every main-loop pass (typically
+ * ~5-10 ms). A single corrupted ADC sample (EMI spike, DMA wrap-around
+ * mid-buffer) can produce a momentary STATE_F or STATE_UNKNOWN, which would
+ * fire FAULT_CAR immediately.
  *
  * Solution: Require CP_DEBOUNCE_CYCLES consecutive *identical* readings before
  * accepting a new state. STATE_UNKNOWN readings are always discarded — the last
  * confirmed valid state is preserved instead.
  *
- * Timing: 3 cycles × ~2 ms loop ≈ 6 ms max latency — well within the 300 ms
- * IEC 61851 transition window.
+ * Timing: 3 passes ≈ 15-30 ms latency — well within the 300 ms IEC 61851
+ * transition window.
  * ─────────────────────────────────────────────────────────────────────────── */
 #define CP_DEBOUNCE_CYCLES  3u   /**< Consecutive identical reads to confirm a new CP state */
 
@@ -40,10 +41,6 @@ static bool     g_waiting_state_ack = false;
 static uint32_t g_state_notify_tick = 0;
 static uint8_t  g_state_notify_retries = 0;
 
-/* Deferred weld-check variables for CHARGING_COMPLETE state */
-static uint32_t charging_complete_entry_tick = 0;
-static bool     relay_open_checked = false;
-
 /* IEC 61851 Table A.5: Fault states must persist >= 300ms before recovery */
 static uint32_t fault_entry_tick = 0;
 
@@ -51,28 +48,26 @@ static uint32_t fault_entry_tick = 0;
  * (see case IDLE below). 0 = unknown / no cable currently connected. */
 static uint8_t g_cable_max_amps = 0;
 
-// Private Variables for Energy
+/* Latest readings per line, written by APP_Energy_Task() */
 Energy_Data_t g_energy_line1 = {0};
 Energy_Data_t g_energy_line2 = {0};
 Energy_Data_t g_energy_line3 = {0};
 
-// Device Status (Error tracking)
+/* Fault and relay status, reported to the Master (CMD_GET_FAULTS) */
 DeviceStatus_t g_device_status = {0};
 
-// Private variables for Comms Task
 /**
- * @brief Circular Buffer Decoupling
- * Used to "linearize" data received from the DMA circular buffer.
- * This ensures that packets larger than the remaining DMA space or split across
- * multiple DMA interrupts are assembled correctly before parsing.
+ * @brief Linear work buffer for the RS485 parser.
+ * Bytes are copied here from the DMA ring buffer so that frames split across
+ * the ring's wrap-around, or across several reads, are parsed in one piece.
  */
 static uint8_t work_buffer[WORK_BUFFER_SIZE];
 static uint16_t work_buffer_len = 0;
-//static uint8_t tx_buffer[10]; // Small buffer for responses
 
-static volatile uint16_t duty 		= 0;
-static volatile bool autorization 	= false;
-static volatile bool session_active	= false;
+/* Session control, written by the comms dispatcher and read by APP_MAIN() */
+static volatile uint16_t duty           = 0;      /* CP duty, 0-1000 (0.1 % steps); 0 = no current offered */
+static volatile bool     authorization  = false;
+static volatile bool     session_active = false;
 
 /* Set by CMD_SET_CURRENT when 'duty' changes; only APP_MAIN() acts on it
  * (see the check right before "Update persistent state" below), so that
@@ -80,36 +75,24 @@ static volatile bool session_active	= false;
  * section instead of being called directly from the comms dispatcher. */
 static volatile bool g_duty_dirty = false;
 
-// Public Variables (External)
+/* Set by the TIM17 callback (main.c), consumed by APP_Energy_Task() */
 volatile uint8_t flag_read_energy;
 volatile uint8_t flag_read_voltage;
 
-volatile uint8_t RCD_Fault = 0;
+volatile uint8_t RCD_Fault = 0;   /* Set by rcd_monitor.c (SysTick ISR), handled in APP_MAIN() */
 
-/* Owned by main.c (set by the EXTI ISR, confirmed by the main-loop debounce).
- * Must be cleared here too whenever we blank a stale RCD trip, or a pending
- * EXTI event from before the blanking survives and re-confirms RCD_Fault on
- * the very next main-loop pass -- silently undoing the blanking. */
-extern volatile bool rcd_pending_check;
-
-/* Owned by main.c -- extends RCD blanking forward in time (see the debounce
- * block there). The RCD module's fault pulse can start with some latency
- * relative to the K1/K4 sense-circuit activation edge and lasts ~60ms, so a
- * one-shot clear right when a verification window closes isn't enough --
- * this keeps suppressing confirmation until well past that window. */
-extern volatile uint32_t rcd_blank_until_tick;
+/* RCD blanking window after a K1/K4 sense-circuit activation (see
+ * RCD_Monitor_Blank()). The RCD module's nuisance pulse can start with some
+ * latency relative to the activation edge and lasts ~60ms, so the window
+ * runs well past the point where each verification ends. */
 #define RCD_BLANK_MARGIN_MS  200u  /**< Comfortably > the observed ~60ms RCD pulse width */
 
-#if ENABLE_PP_SENSE
-/* Owned by main.c -- debug mirror of the last PP reading, see the IDLE
- * case below. Inspect in the debugger (Watch / Live Expressions) to
- * calibrate PP_V_*_OHM_mV (cp.h) against this board's actual PP circuit. */
-extern volatile uint16_t test_pp_mV;
-extern volatile uint8_t  test_pp_amps;
-#endif
+/* What the charger was doing when the last RCD trip was handled -- reported
+ * by CMD_GET_RCD_DIAG next to the pulse width measured by rcd_monitor.c. */
+static uint32_t      g_rcd_trip_current_mA = 0;
+static STATE_MACHINE g_rcd_trip_state      = IDLE;
 
-
-// Private Prototypes
+/* Private Prototypes */
 static void APP_Dispatch_Command(RS485_Frame_t* frame);
 static void APP_Safe_Shutdown(void);
 static void APP_Safety_Check_Electrical(void);
@@ -138,15 +121,15 @@ void APP_MAIN(STATE_MACHINE *currentState) {
     CP_State raw_cp = CP_GetState();
 
     /* Expected transient: once we've killed the PWM to ask the EV to open S2
-     * (CHARGING with autorization/session already false, see the CHARGING
+     * (CHARGING with authorization/session already false, see the CHARGING
      * case below), CP reads the still-connected state-C divider without any
      * PWM -- which CP_GetState() reports as STATE_F by convention. This is
      * neither a fault nor news: treat it exactly like STATE_UNKNOWN (discard,
      * keep the last confirmed state) so it's never confirmed, never sent to
      * the Master via CMD_STATE_NOTIFY, and the FSM simply waits for the real
      * C->B transition once the EV actually reacts. A genuine CP fault while
-     * actually charging (autorization/session both still true) is untouched. */
-    if (*currentState == CHARGING && (!autorization || !session_active) && raw_cp == STATE_F)
+     * actually charging (authorization/session both still true) is untouched. */
+    if (*currentState == CHARGING && (!authorization || !session_active) && raw_cp == STATE_F)
     {
         raw_cp = STATE_UNKNOWN;
     }
@@ -185,13 +168,14 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 
     g_CP_STATE = g_CP_CONFIRMED;  /* Use ONLY the debounce-verified state from here on */
 
-    /* TODO: Execute Grid Voltage and RCD monitoring routines here */
-
+    /* Grid voltage / overcurrent limits (sets fault bits, acted upon below) */
     APP_Safety_Check_Electrical();
 
     /* ── Safety Overrides (highest priority) ── */
     if(RCD_Fault){
     	RCD_Fault = 0;
+    	g_rcd_trip_current_mA = g_energy_line1.current_mA;   /* context for CMD_GET_RCD_DIAG */
+    	g_rcd_trip_state      = *currentState;
     	g_device_status.active_faults |= FAULT_BIT_RCD;
     	g_nextState = FAULT_RCD;
     	goto actuate;
@@ -220,25 +204,19 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 
 
         	session_active	= false;
-        	autorization 	= false;
+        	authorization 	= false;
 
             if (g_CP_STATE == STATE_A) {
                 CP_SetLine_High();
             }
 
 
-            if (g_CP_STATE == STATE_B) { //EV present
+            if (g_CP_STATE == STATE_B) { /* EV present */
                 /* Cable just connected — read its PP coding resistor once to
                  * cap the current we may offer this session (see CMD_SET_CURRENT). */
 #if ENABLE_PP_SENSE
                 {
-                    uint16_t pp_mV = PP_Read_mV();
-                    PP_Current_Rating rating = PP_Classify_Voltage(pp_mV);
-                    /* Debug mirror (see main.c) -- inspect in the debugger
-                     * (Watch / Live Expressions) to calibrate PP_V_*_OHM_mV
-                     * against this board's actual PP pull-up/divider. */
-                    test_pp_mV = pp_mV;
-                    test_pp_amps = PP_Rating_To_Amps(rating);
+                    PP_Current_Rating rating = PP_Classify_Voltage(PP_Read_mV());
                     if (rating == PP_CURRENT_UNKNOWN) {
                         g_nextState = FAULT_CABLE;
                         break;
@@ -270,10 +248,10 @@ void APP_MAIN(STATE_MACHINE *currentState) {
         case READY:
             /* State B -> State C: EV requests charging (S2 closed) */
 
-            if (g_CP_STATE == STATE_C && autorization && session_active && duty != 0) {
+            if (g_CP_STATE == STATE_C && authorization && session_active && duty != 0) {
                 g_nextState = CHARGING;
             }
-            else if (g_CP_STATE == STATE_C && autorization && !session_active) {
+            else if (g_CP_STATE == STATE_C && authorization && !session_active) {
                 g_nextState = READY;
             }
             /* State B -> State A: Cable disconnected by user */
@@ -301,7 +279,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 g_nextState = IDLE;
             }
 
-            else if (g_CP_STATE == STATE_C && (!autorization || !session_active) ) {
+            else if (g_CP_STATE == STATE_C && (!authorization || !session_active) ) {
                 /* If authorisation is lost or session ends during charge:
                  * Turn off PWM to tell EV power is no longer available.
                  * DO NOT transition out yet! Wait for the EV to gracefully
@@ -319,9 +297,9 @@ void APP_MAIN(STATE_MACHINE *currentState) {
              * definition (DC + 6V-equivalent = invalid per IEC). That's the
              * same transient CHARGING_COMPLETE already tolerates by never
              * checking F at all -- here we only ignore it during this one
-             * window (autorization/session already false), a real CP fault
+             * window (authorization/session already false), a real CP fault
              * while actually charging (both still true) still faults as before. */
-            else if (g_CP_STATE == STATE_F && autorization && session_active) {
+            else if (g_CP_STATE == STATE_F && authorization && session_active) {
                 g_nextState = FAULT_CAR;
             }
             /* IEC 61851: State E — CP short to PE */
@@ -338,7 +316,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             /* IEC 61851 Fig A.3: Allow EV to resume charging (B<->C cycling).
              * If Master starts a new session while EV is still connected,
              * transition back to READY so B2->C2 can occur again. */
-            else if (g_CP_STATE == STATE_B && session_active && autorization) {
+            else if (g_CP_STATE == STATE_B && session_active && authorization) {
                 g_nextState = READY;
             }
             /* Note: STATE_F is NOT checked here intentionally.
@@ -479,7 +457,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
             case IDLE:
                 /* Reset Control Pilot to static DC +12V */
                 CP_SetLine_High();
-                autorization   = false;
+                authorization   = false;
                 session_active = false;
                 g_cable_max_amps = 0; /* cable removed (or never connected) — unknown again */
                 duty = 0; /* Forget the last session's current -- a fresh connection
@@ -498,6 +476,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                 break;
 
             case CHARGING:
+#if ENABLE_RELAY_VERIFICATION
                 /* Relay Verification Activation: Before closing relays, verify they are
                  * currently OPEN. If any reads as closed before we command them,
                  * it means a welded contact from a previous session.
@@ -511,27 +490,20 @@ void APP_MAIN(STATE_MACHINE *currentState) {
 
                 {
                     bool k1_closed = Board_Is_K1_Closed();
-#if !IGNORE_K4_FEEDBACK
                     bool k4_closed = Board_Is_K4_Closed();
-#else
-                    bool k4_closed = false;
-#endif
                     Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
 
 #if RCD_BLANK_DURING_RELAY_VERIFICATION
                     /* EMI Blanking: powering the K1/K4 sense circuit (and the
                      * settling delay above) is the actual moment noise has been
                      * observed coupling into the RCD sensor line -- not the
-                     * relay coil switching itself. Clear any RCD fault/pending
-                     * check picked up during this verification window so a
+                     * relay coil switching itself. Revoke any RCD trip
+                     * picked up during this verification window so a
                      * routine pre-charge check isn't misread as a real
                      * residual-current event, and extend the blanking window
                      * forward -- the RCD module's ~60ms pulse can start with
                      * some latency, possibly after this point. */
-                    RCD_Fault = 0;
-                    rcd_pending_check = false;
-                    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-                    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+                    RCD_Monitor_Blank(RCD_BLANK_MARGIN_MS);
 #endif
 
                     if (k1_closed || k4_closed) {
@@ -543,6 +515,7 @@ void APP_MAIN(STATE_MACHINE *currentState) {
                         break;
                     }
                 }
+#endif /* ENABLE_RELAY_VERIFICATION */
 
                 /* Lock the connector before energizing -- can't be pulled while live */
                 Board_Lock_Cable();
@@ -670,65 +643,68 @@ static void APP_Update_Status_LED(STATE_MACHINE state) {
     Board_Set_LED(((HAL_GetTick() / (period_ms / 2)) % 2) == 0);
 }
 
-// Retorna o número de bytes processados/descartados para que o main possa limpar o buffer
+/**
+ * @brief  Scans a byte buffer for the first valid RS485 frame.
+ * @param  buffer Linear buffer of received bytes.
+ * @param  length Number of valid bytes in buffer.
+ * @param  frame  Filled in when a valid frame is found (frame->cmd != 0).
+ * @return Number of bytes the caller can discard: everything up to and
+ *         including the frame found, or the garbage skipped before an
+ *         incomplete frame (which is kept for the next call).
+ * @note   Frame: [STARTBYTE][LEN][DEST_ID][CMD][DATA 0..DATA_RS485][CRC].
+ *         Returns after the first valid frame, so at most one command is
+ *         dispatched per call. A STARTBYTE value inside garbage is handled by
+ *         advancing one byte whenever the length or the CRC doesn't check out.
+ */
 uint16_t APP_RS485_Parser(uint8_t* buffer, uint16_t length, RS485_Frame_t* frame) {
     uint16_t i = 0;
 
     while (i < length) {
-        // 1. Procura STARTBYTE
+        /* 1. Find the start byte */
         if (buffer[i] != STARTBYTE) {
             i++;
-            continue; // Continua a procurar
+            continue;
         }
 
-        // 2. Verifica se temos tamanho mínimo para ler o cabeçalho (4 bytes)
+        /* 2. Need at least the 4-byte header; otherwise keep these bytes for next time */
         if ((length - i) < 4) {
-            // Não temos dados suficientes nem para o cabeçalho.
-            // Paramos aqui e dizemos ao main para manter estes bytes para a próxima vez.
             return i;
         }
 
         uint8_t payload_len = buffer[i + 1];
         uint8_t total_frame_size = 4 + payload_len + 1; // Header + Payload + CRC
 
-        // . Reject oversized frames (corrupted payload_len)
+        /* 3. Reject impossible lengths: this start byte was data, not a frame */
         if (total_frame_size > (DATA_RS485 + 5)) {  // max = header(4) + payload(10) + CRC(1) = 15
-            i++;       // skip this fake start byte
-            continue;  // try next byte
+            i++;
+            continue;
         }
-        // . Wait for complete frame (valid size, but not all bytes received yet)
+        /* 4. Valid length, but the frame hasn't fully arrived yet */
         if ((length - i) < total_frame_size) {
             return i;
         }
-        // 4. Verifica CRC
+        /* 5. Check the CRC */
         uint8_t receive_CRC = buffer[i + total_frame_size - 1];
         uint8_t calculate_CRC = Calculate_CRC(&buffer[i], total_frame_size - 1);
 
         if (calculate_CRC == receive_CRC) {
-            // SUCESSO: Preenche a estrutura
             frame->len = buffer[i + 1];
             frame->dest_ID = buffer[i + 2];
             frame->cmd = buffer[i + 3];
 
-            // Proteção contra overflow do buffer de destino
+            /* Never copy more than the destination can hold */
             uint8_t copy_len = (payload_len > DATA_RS485) ? DATA_RS485 : payload_len;
             memcpy(frame->data_RX, &buffer[i + 4], copy_len);
 
-            // Consumimos este pacote inteiro
+            /* Consume the whole frame; the caller dispatches it right away */
             i += total_frame_size;
-
-            // Opcional: Se só queremos processar 1 pacote por ciclo, retornamos aqui
-            // Mas é melhor retornar i no fim para indicar tudo o que foi lido.
-            // Nota: O main precisa saber que houve SUCESSO para agir sobre o 'frame'.
-            // Esta função idealmente retornaria um status enum, ou usaria ponteiros.
-            return i; // Retorna até onde lemos (neste caso, assumindo que o main processa o frame imediatamente)
+            return i;
         } else {
-            // CRC falhou. O byte 'AA' pode ser dados (lixo).
-            // Avançamos apenas 1 byte para tentar encontrar um novo 'AA' válido logo a seguir.
+            /* Bad CRC: this start byte was data -- resync from the next byte */
             i++;
         }
     }
-    return i; // Retorna total de bytes processados (lixo)
+    return i; /* No start byte found: everything scanned was garbage */
 }
 
 /**
@@ -765,43 +741,18 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
         case CMD_AUTH_TRUE:
         {
-        	autorization = true;
+        	authorization = true;
 			//Send ACK
         	Transmit_frame.dest_ID = ID_MASTER;
         	Transmit_frame.cmd = CMD_AUTH_TRUE;
         	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
         	Transmit_frame.len = 1;
         	APP_RS485_Send_Message(&Transmit_frame);
-
-        	/*
-            RS485_Frame_t ack_frame;
-            memset(&ack_frame, 0, sizeof(ack_frame));
-            ack_frame.dest_ID = 0x00; // Assuming Master ID is 0x00
-            ack_frame.cmd = CMD_AUTH_SET;
-            ack_frame.len = 1;
-
-            if (frame->data_RX[0] == AUTH_TRUE) {
-                autorization = true;
-                // Optional: Immediate feedback or state change trigger
-                // If in IDLE and CP is connected, this might allow transition to READY in next loop
-                Board_SetContactor_K2(CMD_ACTIVATE);
-                ack_frame.data_RX[0] = 0xAB; // ACK Auth
-               // RS485_Send_Package(ack_frame.data_RX[0], 1);
-            }
-            else if (frame->data_RX[0] == AUTH_FALSE) {
-            	Board_SetContactor_K2(CMD_DEACTIVATE);
-                autorization = false;
-                ack_frame.data_RX[0] = 0xAC; // NACK Auth
-                //RS485_Send_Package(ack_frame.data_RX[0], 1);
-            }
-
-            APP_RS485_Send_Message(&ack_frame);
-            */
             break;
         }
 
         case CMD_AUTH_FALSE:
-        	autorization = false;
+        	authorization = false;
         	duty = 0; /* Kill PWM to signal car */
         	g_duty_dirty = true;
 			//Send ACK
@@ -825,7 +776,7 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         case CMD_SESSION_START:
 
         	session_active = true;
-        	autorization = true;
+        	authorization = true;
         	Transmit_frame.dest_ID = ID_MASTER;
         	Transmit_frame.cmd = CMD_SESSION_START;
         	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
@@ -837,7 +788,7 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         case CMD_SESSION_STOP:
 
         	session_active = false;
-        	autorization = false;
+        	authorization = false;
         	duty = 0; /* Kill PWM to signal car */
         	g_duty_dirty = true;
         	Transmit_frame.dest_ID = ID_MASTER;
@@ -908,14 +859,15 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 	        	Transmit_frame.len = 1;
 	        	APP_RS485_Send_Message(&Transmit_frame);
 
-				 /* Optional: Save the current state to a global variable for monitoring */
-				 //device_status.active_max_current = requested_current;
-
         	}
 
         	break;
 
-        case CMD_RELAY_SET: // activation here only for test purposes
+        case CMD_RELAY_SET:
+        	/* Bench test only (master_test.py 'relay on'): closes the contactors
+        	 * directly, bypassing the state machine -- no cable lock, no weld
+        	 * check, no closed-contact verification. Refused while an RCD fault
+        	 * is active. Never use with a vehicle connected. */
 
         	Transmit_frame.dest_ID = ID_MASTER;
         	Transmit_frame.cmd = CMD_RELAY_SET;
@@ -928,10 +880,7 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 #if RCD_BLANK_DURING_RELAY_VERIFICATION
                 /* EMI Blanking for test command */
                 HAL_Delay(50);
-                RCD_Fault = 0;
-                rcd_pending_check = false;
-                __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-                rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+                RCD_Monitor_Blank(RCD_BLANK_MARGIN_MS);
 #endif
 
 				//Send ACK
@@ -1014,14 +963,11 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
 #if RCD_BLANK_DURING_RELAY_VERIFICATION
         	/* EMI Blanking: same sense-circuit activation as
-        	 * APP_Verify_Relays_Closed/Open() -- clear any RCD fault/pending
-        	 * check picked up during this bench read so it isn't misread as
+        	 * APP_Verify_Relays_Closed/Open() -- revoke any RCD trip
+        	 * picked up during this bench read so it isn't misread as
         	 * a real residual-current event, and extend the blanking window
         	 * forward in case the RCD module's pulse starts late. */
-        	RCD_Fault = 0;
-        	rcd_pending_check = false;
-        	__HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-        	rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+        	RCD_Monitor_Blank(RCD_BLANK_MARGIN_MS);
 #endif
 
 			//Send ACK
@@ -1045,6 +991,55 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
         	Transmit_frame.len = 3;
         	APP_RS485_Send_Message(&Transmit_frame);
         	break;
+
+        case CMD_GET_DIAG:
+        {
+        	/* Payload layout: see CMD_GET_DIAG in app_manager.h */
+        	Comms_Diag_t comms;
+        	Comms_Get_Diag(&comms);
+        	uint32_t uptime_s = HAL_GetTick() / 1000u;
+
+        	Transmit_frame.dest_ID = ID_MASTER;
+        	Transmit_frame.cmd = CMD_GET_DIAG;
+        	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
+        	Transmit_frame.data_RX[1] = (uint8_t)(uptime_s >> 24);             //MSB
+        	Transmit_frame.data_RX[2] = (uint8_t)(uptime_s >> 16);
+        	Transmit_frame.data_RX[3] = (uint8_t)(uptime_s >> 8);
+        	Transmit_frame.data_RX[4] = (uint8_t)(uptime_s & 0xFF);            //LSB
+        	Transmit_frame.data_RX[5] = (uint8_t)(comms.uart_errors >> 8);     //MSB
+        	Transmit_frame.data_RX[6] = (uint8_t)(comms.uart_errors & 0xFF);   //LSB
+        	Transmit_frame.data_RX[7] = (uint8_t)(comms.rx_restarts >> 8);     //MSB
+        	Transmit_frame.data_RX[8] = (uint8_t)(comms.rx_restarts & 0xFF);   //LSB
+        	Transmit_frame.data_RX[9] = comms.tx_recoveries;
+        	Transmit_frame.len = 10;
+        	APP_RS485_Send_Message(&Transmit_frame);
+        	break;
+        }
+
+        case CMD_GET_RCD_DIAG:
+        {
+        	/* Payload layout: see CMD_GET_RCD_DIAG in app_manager.h */
+        	RCD_Diag_t rcd;
+        	RCD_Monitor_Get_Diag(&rcd);
+        	uint16_t trip_current = (uint16_t)(g_rcd_trip_current_mA / 100);   /* 0.1 A, as CMD_GET_CURRENT */
+
+        	Transmit_frame.dest_ID = ID_MASTER;
+        	Transmit_frame.cmd = CMD_GET_RCD_DIAG;
+        	Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
+        	Transmit_frame.data_RX[1] = (uint8_t)(rcd.trip_width_ms >> 8);      //MSB
+        	Transmit_frame.data_RX[2] = (uint8_t)(rcd.trip_width_ms & 0xFF);    //LSB
+        	Transmit_frame.data_RX[3] = (uint8_t)((rcd.trip_ongoing  ? RCD_DIAG_FLAG_ONGOING  : 0) |
+        	                                      (rcd.trip_recorded ? RCD_DIAG_FLAG_RECORDED : 0));
+        	Transmit_frame.data_RX[4] = (uint8_t)(rcd.rejected_count >> 8);     //MSB
+        	Transmit_frame.data_RX[5] = (uint8_t)(rcd.rejected_count & 0xFF);   //LSB
+        	Transmit_frame.data_RX[6] = (uint8_t)(rcd.rejected_max_ms > 255 ? 255 : rcd.rejected_max_ms);
+        	Transmit_frame.data_RX[7] = (uint8_t)(trip_current >> 8);           //MSB
+        	Transmit_frame.data_RX[8] = (uint8_t)(trip_current & 0xFF);         //LSB
+        	Transmit_frame.data_RX[9] = (uint8_t)g_rcd_trip_state;
+        	Transmit_frame.len = 10;
+        	APP_RS485_Send_Message(&Transmit_frame);
+        	break;
+        }
 
         case CMD_CLEAR_FAULTS:
 
@@ -1161,9 +1156,9 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 
 
         case CMD_STATE_NOTIFY:
-            /* Se recebermos o comando STATE_NOTIFY e o payload for um ACK */
+            /* The Master acknowledging our last CMD_STATE_NOTIFY */
             if (frame->len > 0 && frame->data_RX[0] == CMD_ACK) {
-                g_waiting_state_ack = false; // Sucesso: Cancelamos o timeout/retransmissão
+                g_waiting_state_ack = false; /* stop the retries */
             }
             break;
 
@@ -1177,45 +1172,34 @@ static void APP_Dispatch_Command(RS485_Frame_t* frame) {
 }
 
 /**
- * @brief  Main Communication Logic Task.
- * @note   This function implements a "Producer-Consumer" pattern for UART/RS485 data.
- *         It performs 4 key steps:
- *         1. FETCH: Moves raw bytes from DMA (Hardware) to Work Buffer (Application).
- *         2. PARSE: Scans the Work Buffer for valid packets (Start Byte + Length + CRC).
- *         3. DISPATCH: If a valid packet is found, executes the corresponding command.
- *         4. CLEAN: Shifts the buffer to discard processed data and prepare for new bytes.
- *
- * @warning Must be called periodically in the main loop (e.g., every 10ms or in a FreeRTOS task).
+ * @brief  RS485 communication task -- call on every main-loop pass.
+ * @note   1. Fetch: moves new bytes from the DMA ring buffer to work_buffer.
+ *         2. Parse: finds the first valid frame (start byte, length, CRC).
+ *         3. Dispatch: executes that frame's command.
+ *         4. Clean: drops the bytes the parser consumed.
+ *         5. Retries the last CMD_STATE_NOTIFY until the Master ACKs it.
  */
 void APP_Comms_Task(void) {
-    // 1. Fetch new data from DMA into Work Buffer
+    /* 1. Fetch */
     uint16_t space_left = WORK_BUFFER_SIZE - work_buffer_len;
     if (space_left > 0) {
         uint16_t bytes_read = RS485_Get_Data(&work_buffer[work_buffer_len], space_left);
         work_buffer_len += bytes_read;
     }
 
-    // 2. Process Data if available
     if (work_buffer_len > 0) {
-        RS485_Frame_t frame_recebida;
-        memset(&frame_recebida, 0, sizeof(frame_recebida));
+        RS485_Frame_t rx_frame;
+        memset(&rx_frame, 0, sizeof(rx_frame));
 
-        // Parse buffer
-        uint16_t bytes_processed = APP_RS485_Parser(work_buffer, work_buffer_len, &frame_recebida);
+        /* 2. Parse */
+        uint16_t bytes_processed = APP_RS485_Parser(work_buffer, work_buffer_len, &rx_frame);
 
-        // 3. Dispatch Valid Frame
-        // Note: APP_RS485_Parser logic in this file returns 'i' (bytes processed).
-        // It doesn't explicitly return "Success/Fail" easily without checking if a frame was filled.
-        // We check if cmd is not 0 (assuming 0 is not a valid cmd) or by a flag.
-        // Given existing logic, if bytes_processed > 0 AND we have a valid header/crc check inside...
-        // Actually, the current Parser returns 'i' which increments on success.
-        // We added a basic check: if frame_recebida.cmd is set (assuming 0 initialization).
-
-        if (bytes_processed > 0 && frame_recebida.cmd != 0) {
-            APP_Dispatch_Command(&frame_recebida);
+        /* 3. Dispatch -- the parser leaves rx_frame.cmd at 0 unless it found a valid frame */
+        if (bytes_processed > 0 && rx_frame.cmd != 0) {
+            APP_Dispatch_Command(&rx_frame);
         }
 
-        // 4. Buffer Cleanup (Shift Left)
+        /* 4. Clean: shift the unprocessed bytes to the front */
         if (bytes_processed > 0) {
             uint16_t remaining = work_buffer_len - bytes_processed;
             if (remaining > 0) {
@@ -1225,43 +1209,30 @@ void APP_Comms_Task(void) {
         }
     }
 
-    /*
-    RS485_Frame_t Transmit_frame;
-    memset(&Transmit_frame, 0, sizeof(Transmit_frame));
-   	Transmit_frame.dest_ID = ID_MASTER;
-    Transmit_frame.cmd = CMD_HEARTBEAT;
-    Transmit_frame.data_RX[0] = (uint8_t)CMD_ACK;
-    Transmit_frame.len = 1;
-    APP_RS485_Send_Message(&Transmit_frame);
-    */
-
+    /* 5. CMD_STATE_NOTIFY retries */
     if (g_waiting_state_ack) {
-           if ((HAL_GetTick() - g_state_notify_tick) > STATE_NOTIFY_TIMEOUT_MS) {
+        if ((HAL_GetTick() - g_state_notify_tick) > STATE_NOTIFY_TIMEOUT_MS) {
 
-               if (g_state_notify_retries < STATE_NOTIFY_MAX_RETRIES) {
-                   // Tenta retransmitir
-                   g_state_notify_retries++;
-                   g_state_notify_tick = HAL_GetTick(); // Reinicia o timer
+            if (g_state_notify_retries < STATE_NOTIFY_MAX_RETRIES) {
+                g_state_notify_retries++;
+                g_state_notify_tick = HAL_GetTick();
 
-                   RS485_Frame_t notify;
-                   memset(&notify, 0, sizeof(notify));
-                   notify.dest_ID    = ID_MASTER;
-                   notify.cmd        = CMD_STATE_NOTIFY;
-                   notify.data_RX[0] = (uint8_t)g_CP_STATE; // Reenvia o estado atual
-                   notify.data_RX[1] = g_cable_max_amps;
-                   notify.len = 2;
-                   APP_RS485_Send_Message(&notify);
-               } else {
-                   // Esgotaram-se as tentativas - Declarar perda de comunicação!
-                   g_waiting_state_ack = false;
-                   //g_state_notify_retries = 0;
-
-                   // Opcional: Levantar flag de erro de comunicação
-                   // g_device_status.active_faults |= FAULT_BIT_COMM;
-                   // (Se desejares que o EVSE passe a um estado de falha quando perde ligação)
-               }
-           }
-       }
+                RS485_Frame_t notify;
+                memset(&notify, 0, sizeof(notify));
+                notify.dest_ID    = ID_MASTER;
+                notify.cmd        = CMD_STATE_NOTIFY;
+                notify.data_RX[0] = (uint8_t)g_CP_STATE; /* current state, not the one first sent */
+                notify.data_RX[1] = g_cable_max_amps;
+                notify.len = 2;
+                APP_RS485_Send_Message(&notify);
+            } else {
+                /* Retries exhausted: give up on this notification.
+                 * FAULT_BIT_COMM is defined but not raised here, so losing
+                 * the Master does not stop an ongoing session. */
+                g_waiting_state_ack = false;
+            }
+        }
+    }
 }
 
 
@@ -1285,48 +1256,29 @@ void APP_Voltage_Flag_Set(void){
 
 
 /**
- * @brief  Energy Monitoring Task.
- * @note   Reads critical registers (Vrms, Power, Energy) from the ADE7953.
- *         The execution is gated by a timer flag (flag_read_energy) to prevent
- *         flooding the SPI bus and blocking the main loop excessively.
+ * @brief  Energy monitoring task -- reads the three ADE7953 over SPI.
+ * @note   Gated by the TIM17 flags (main.c) so the SPI bus isn't polled on
+ *         every loop pass: Vrms/Irms on flag_read_voltage (every 100 ms, used
+ *         by the grid/overcurrent checks), active power and line frequency
+ *         on flag_read_energy (every 10 s).
+ * @note   active_power_W is filled from ade7953_get_active_power_mW(), and
+ *         POWER_LSB_mW_* (energy_meter.h) are still uncalibrated placeholders,
+ *         so the power readings are not meaningful yet.
  */
 void APP_Energy_Task(void) {
-
-
 
 	if(flag_read_voltage){
 
 		flag_read_voltage = 0;
 
-
-		//solução temporária para teste
-	    static bool calibrating = false;
-	    static uint32_t cal_result1 = 0;
-	    static uint32_t cal_result2 = 0;
-	    static uint32_t cal_result3 = 0;
-	    if (calibrating) {
-	        if (ade7953_calibrate_vrms(ADE_DEVICE_3, 100, &cal_result3)) {
-	            //calibrating = false;
-	            // cal_result → lê no debugger ou envia por RS485
-	        }
-	        if (ade7953_calibrate_vrms(ADE_DEVICE_2, 100, &cal_result2)) {
-	            //calibrating = false;
-	            // cal_result → lê no debugger ou envia por RS485
-	        }
-	        if (ade7953_calibrate_vrms(ADE_DEVICE_1, 100, &cal_result1)) {
-	            calibrating = false;
-	            // cal_result → lê no debugger ou envia por RS485
-	        }
-	        return;
-	    }
         /* Line 1 */
         g_energy_line1.vrms_mV        = ade7953_get_vrms_mV(ADE_DEVICE_1);
         g_energy_line1.current_mA     = ade7953_get_irms_mA(ADE_DEVICE_1);
-        
+
         /* Line 2 */
         g_energy_line2.vrms_mV        = ade7953_get_vrms_mV(ADE_DEVICE_2);
         g_energy_line2.current_mA     = ade7953_get_irms_mA(ADE_DEVICE_2);
-        
+
         /* Line 3 */
         g_energy_line3.vrms_mV        = ade7953_get_vrms_mV(ADE_DEVICE_3);
         g_energy_line3.current_mA     = ade7953_get_irms_mA(ADE_DEVICE_3);
@@ -1335,21 +1287,19 @@ void APP_Energy_Task(void) {
 	if(flag_read_energy){
 
 		flag_read_energy = 0;
-        
+
         /* Line 1 */
         g_energy_line1.active_power_W = ade7953_get_active_power_mW(ADE_DEVICE_1);
         g_energy_line1.freq_dec_Hz 	  = ade7953_get_line_frequency(ADE_DEVICE_1);
-        
+
         /* Line 2 */
         g_energy_line2.active_power_W = ade7953_get_active_power_mW(ADE_DEVICE_2);
         g_energy_line2.freq_dec_Hz 	  = ade7953_get_line_frequency(ADE_DEVICE_2);
-        
+
         /* Line 3 */
         g_energy_line3.active_power_W = ade7953_get_active_power_mW(ADE_DEVICE_3);
         g_energy_line3.freq_dec_Hz 	  = ade7953_get_line_frequency(ADE_DEVICE_3);
 	}
-
-
 }
 
 /**
@@ -1367,9 +1317,15 @@ static void APP_Safe_Shutdown(void) {
  *         close-error bits [3:0] are SET in status->relay_errors.
  * @return true if ALL relays confirmed closed, false if any failed.
  * @note   Waits RELAY_SETTLING_TIME_MS before reading feedback pins.
+ * @note   ENABLE_RELAY_VERIFICATION == 0 (feature_config.h): reads nothing,
+ *         never powers the sense circuit, always returns true.
  */
 bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
 
+#if !ENABLE_RELAY_VERIFICATION
+    (void)status;
+    return true;
+#else
     bool all_ok = false;
 
     /* K1/K4 feedback needs its sense circuit powered before any of the
@@ -1391,9 +1347,7 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
         if (!Board_Is_K2_Closed()) all_ok = false;
         if (!Board_Is_K3_Closed()) all_ok = false;
 #endif
-#if !IGNORE_K4_FEEDBACK
         if (!Board_Is_K4_Closed()) all_ok = false;
-#endif
 
         if (all_ok) break; /* They all successfully closed! Proceed immediately. */
     }
@@ -1423,31 +1377,27 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
         all_ok = false;
     }
 #endif
-        
-#if !IGNORE_K4_FEEDBACK
+
     if (!Board_Is_K4_Closed()) {
         status->relay_errors |= RELAY_ERR_K4_CLOSE;
         all_ok = false;
     }
-#endif
 
     Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
 
 #if RCD_BLANK_DURING_RELAY_VERIFICATION
     /* EMI Blanking: powering the K1/K4 sense circuit for this whole
      * verification window is what has been observed coupling noise into
-     * the RCD sensor line -- not the contactor coils switching. Clear any
-     * RCD fault/pending-check picked up during it so a routine relay
+     * the RCD sensor line -- not the contactor coils switching. Revoke any
+     * RCD trip picked up during it so a routine relay
      * verification isn't misread as a real residual-current event, and
      * extend the blanking window forward -- the RCD module's ~60ms pulse
      * can start with some latency, possibly after this point. */
-    RCD_Fault = 0;
-    rcd_pending_check = false;
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+    RCD_Monitor_Blank(RCD_BLANK_MARGIN_MS);
 #endif
 
     return all_ok;
+#endif /* ENABLE_RELAY_VERIFICATION */
 }
 
 /**
@@ -1456,9 +1406,15 @@ bool APP_Verify_Relays_Closed(DeviceStatus_t *status) {
  *         corresponding open-error bits [7:4] are SET in status->relay_errors.
  * @return true if ALL relays confirmed open, false if any is still closed (welded).
  * @note   Waits RELAY_SETTLING_TIME_MS before reading feedback pins.
+ * @note   ENABLE_RELAY_VERIFICATION == 0 (feature_config.h): reads nothing,
+ *         never powers the sense circuit, always returns true.
  */
 bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
 
+#if !ENABLE_RELAY_VERIFICATION
+    (void)status;
+    return true;
+#else
     bool all_ok = false;
 
     /* K1/K4 feedback needs its sense circuit powered before any of the
@@ -1479,16 +1435,13 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
         if (Board_Is_K2_Closed()) all_ok = false;
         if (Board_Is_K3_Closed()) all_ok = false;
 #endif
-#if !IGNORE_K4_FEEDBACK
         if (Board_Is_K4_Closed()) all_ok = false;
-#endif
 
         if (all_ok) break; /* They all successfully opened (discharged)! */
     }
 
     /* Clear previous open errors, preserve close errors */
     status->relay_errors &= ~RELAY_ERR_OPEN_MASK;
-    //HAL_Delay(100);
 
     /* Final decisive read: start clean so a stale timeout from the polling
      * loop above can't fail this check when the relays are actually fine
@@ -1510,30 +1463,26 @@ bool APP_Verify_Relays_Open(DeviceStatus_t *status) {
         all_ok = false;
     }
 #endif
-#if !IGNORE_K4_FEEDBACK
     if (Board_Is_K4_Closed()) {
         status->relay_errors |= RELAY_ERR_K4_OPEN;
         all_ok = false;
     }
-#endif
 
     Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
 
 #if RCD_BLANK_DURING_RELAY_VERIFICATION
     /* EMI Blanking: powering the K1/K4 sense circuit for this whole
      * verification window is what has been observed coupling noise into
-     * the RCD sensor line -- not the contactor coils switching. Clear any
-     * RCD fault/pending-check picked up during it so a routine relay
+     * the RCD sensor line -- not the contactor coils switching. Revoke any
+     * RCD trip picked up during it so a routine relay
      * verification isn't misread as a real residual-current event, and
      * extend the blanking window forward -- the RCD module's ~60ms pulse
      * can start with some latency, possibly after this point. */
-    RCD_Fault = 0;
-    rcd_pending_check = false;
-    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-    rcd_blank_until_tick = HAL_GetTick() + RCD_BLANK_MARGIN_MS;
+    RCD_Monitor_Blank(RCD_BLANK_MARGIN_MS);
 #endif
 
     return all_ok;
+#endif /* ENABLE_RELAY_VERIFICATION */
 }
 
 
@@ -1581,6 +1530,11 @@ static void APP_Safety_Check_Electrical(void) {
 }
 
 
+/**
+ * @brief  Frame checksum: additive sum (mod 256) of every byte given.
+ * @param  buffer_d  Bytes to sum (header + payload).
+ * @param  frame_len Number of bytes.
+ */
 uint8_t Calculate_CRC(uint8_t* buffer_d, uint8_t frame_len){
 	uint8_t sum = 0;
 
@@ -1590,13 +1544,20 @@ uint8_t Calculate_CRC(uint8_t* buffer_d, uint8_t frame_len){
 	return sum;
 }
 
+/**
+ * @brief  Builds and sends one RS485 frame to the Master.
+ * @param  tx_frame dest_ID, cmd, len and data_RX (the payload) to send.
+ * @note   Frame: [STARTBYTE][LEN][DEST_ID][CMD][DATA 0..DATA_RS485][CRC].
+ *         The frame is built in a local buffer: RS485_Send_Package() copies
+ *         it into its own DMA buffer once the previous frame has left (see
+ *         tx_dma_buffer in comms_manager.c).
+ */
 void APP_RS485_Send_Message(RS485_Frame_t* tx_frame){
 
-	// static é bom para o DMA, mas cuidado com reentrância (não chamar em IT e Main ao mesmo tempo)
-	    static uint8_t temp_buffer[DATA_RS485 + 5];
+	    uint8_t temp_buffer[DATA_RS485 + 5];
 	    uint8_t calculated_crc = 0;
 
-	    // Proteção contra overflow de payload
+	    /* Payload larger than the protocol allows: drop it */
 	    if (tx_frame->len > DATA_RS485) {
 	        return;
 	    }
@@ -1607,47 +1568,17 @@ void APP_RS485_Send_Message(RS485_Frame_t* tx_frame){
 	    temp_buffer[3] = tx_frame->cmd;
 
 	    if (tx_frame->len > 0) {
-	        // Assume-se que tx_frame->data_RX contém os dados a enviar (ou muda para data_TX)
 	        memcpy(&temp_buffer[4], tx_frame->data_RX, tx_frame->len);
 	    }
 
-	    // Calcula CRC sobre Header + Dados
+	    /* CRC over header + payload */
 	    calculated_crc = Calculate_CRC(temp_buffer, tx_frame->len + 4);
 	    temp_buffer[tx_frame->len + 4] = calculated_crc;
 
-	    // Aguarda um curto período para permitir que o Raspberry Pi liberte o bus (Turnaround Delay)
-	    // Como o Pi corre um OS não-RealTime, a latência do GPIO mudar para modo Receção pode demorar uns milissegundos.
+	    /* Bus turnaround: give the Master (a Raspberry Pi, not real-time) time
+	     * to release the RS485 bus and switch its transceiver back to receive. */
 	    HAL_Delay(10);
 
-	    // Envia: Header(4) + Data(len) + CRC(1) = len + 5
+	    /* Header(4) + Data(len) + CRC(1) */
 	    RS485_Send_Package(temp_buffer, tx_frame->len + 5);
-}
-
-
-//only for test
-void APP_TEST_Contactor_Monitor(void){
-
-	Board_Set_Contactors(CMD_ACTIVATE);
-
-
-	  bool k1_state;
-	  bool k2_state;
-	  bool k3_state;
-	  bool k4_state;
-
-
-	  k1_state = Board_Is_K1_Closed();
-	  k2_state = Board_Is_K2_Closed();
-	  k3_state = Board_Is_K3_Closed();
-	  k4_state = Board_Is_K4_Closed();
-
-	  HAL_Delay(1000);
-	Board_Set_Contactors(CMD_DEACTIVATE);
-
-
-
-	  k1_state = Board_Is_K1_Closed();
-	  k2_state = Board_Is_K2_Closed();
-	  k3_state = Board_Is_K3_Closed();
-	  k4_state = Board_Is_K4_Closed();
 }

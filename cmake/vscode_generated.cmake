@@ -24,6 +24,7 @@ target_sources(${BUILD_UNIT_0_NAME} PRIVATE
     "Core/Src/i2c.c"
     "Core/Src/iwdg.c"
     "Core/Src/main.c"
+    "Core/Src/rcd_monitor.c"
     "Core/Src/spi.c"
     "Core/Src/stm32c0xx_hal_msp.c"
     "Core/Src/stm32c0xx_it.c"

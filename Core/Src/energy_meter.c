@@ -285,10 +285,10 @@ uint32_t ade7953_get_vrms_mV(ADE_DEVICE device) {
 
     }
 
-    // (Ainda usando a tua macro antiga ou as calibrações dinâmicas que falámos antes)
+    /* Raw register -> mV with this device's Q16.16 calibration factor */
     uint32_t new_sample = (uint32_t)(((uint64_t)raw * VRMS_FACTOR) >> 16);
     uint8_t idx = (uint8_t)device;
-    // Processar o filtro de média móvel
+    /* Moving-average filter */
     return process_sliding_window(&vrms_window[idx], new_sample);
 }
 
@@ -438,31 +438,31 @@ uint16_t ade7953_get_line_frequency(ADE_DEVICE device){
 }
 
 static uint32_t process_sliding_window(SlidingWindow_t *win, uint32_t new_sample) {
-    // Se for a primeiríssima amostra (count == 0), preenchemos tudo com ela.
-    // Assim eliminamos o tempo de aquecimento e as transições mortas.
+    /* First sample ever: seed the whole window with it, so the average is
+     * valid immediately instead of ramping up from zero. */
     if (win->count == 0) {
         for (uint8_t i = 0; i < WINDOW_SIZE; i++) {
             win->buffer[i] = new_sample;
         }
-        win->sum = new_sample * WINDOW_SIZE; // ou (new_sample << WINDOW_SIZE_SHIFT)
+        win->sum = new_sample * WINDOW_SIZE;
         win->index = 0;
-        win->count = WINDOW_SIZE; // Marca como permanentemente cheio
+        win->count = WINDOW_SIZE; // window is full from now on
 
         return new_sample;
     }
-    // Código ultra-rápido SEM divisões:
-    // 1. Envolve o índice
+    /* Running sum, no division:
+     * 1. Wrap the index */
     if (win->index >= WINDOW_SIZE) win->index = 0;
-    // 2. Remove a amostra mais velha do somatório
+    /* 2. Drop the oldest sample from the sum */
     win->sum -= win->buffer[win->index];
 
-    // 3. Guarda a amostra mais recente
+    /* 3. Store the newest sample */
     win->buffer[win->index] = new_sample;
 
-    // 4. Adiciona a nova ao somatório
+    /* 4. Add it to the sum */
     win->sum += new_sample;
     win->index++;
-    // 5. Retorna a média usando bit shift (Ex: >> 4 equivale a dividir por 16)
+    /* 5. Average = sum / WINDOW_SIZE, as a shift (WINDOW_SIZE is a power of two) */
     return (win->sum >> WINDOW_SIZE_SHIFT);
 }
 
@@ -482,10 +482,10 @@ bool ade7953_calibrate_vrms(ADE_DEVICE device, uint16_t num_samples, uint32_t *r
     count++;
     if (count >= num_samples) {
         *result = (uint32_t)(accumulator / num_samples);
-        // Reset para eventual reutilização
+        /* Reset so the calibration can be run again */
         accumulator = 0;
         count = 0;
-        return true;   // acabou
+        return true;   // done
     }
-    return false;  // ainda a recolher
+    return false;  // still collecting
 }

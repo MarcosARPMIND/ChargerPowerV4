@@ -51,12 +51,12 @@
 /* ============================================================================== */
 
 /* --- RS485 TRANSCEIVER DIRECTION (Output) --- */
-/* Mapping for define the direction of the transceiver */
+/* Drives the transceiver's DE/RE (tied together): HIGH = transmit, LOW = receive */
 #define RS485_DE_PORT               GPIOA
 #define RS485_DE_PIN                GPIO_PIN_1      /* RS485 DE/RE Control Pin (PA1) */
 
 /* --- SPI CHIP SELECTS (Outputs) --- */
-/* Mapping for SPI Slaves (Ensure names match connected devices in future) */
+/* One chip select per ADE7953 (device 1..3 = line 1..3), active LOW */
 #define SPI_CS_1_PORT               GPIOA
 #define SPI_CS_1_PIN                GPIO_PIN_4      /* Device 1 CS */
 
@@ -67,30 +67,19 @@
 #define SPI_CS_3_PIN                GPIO_PIN_5      /* Device 3 CS */
 
 
-/* --- RS485 / UART2 (Modbus/External) --- */
-/* Note: DE/RE control is handled by RS485_DE_PORT/PIN above (PA1) */
-
-/* Note: UART pins are configured via CubeMX (.ioc). Defined here for context only. */
+/* --- USART2: RS485 link to the Master --- */
+/* Note: UART pins are configured via CubeMX (.ioc). Defined here for context only.
+ * DE/RE is RS485_DE_PORT/PIN above (PA1). */
 #define UART0_RX_PORT               GPIOA
 #define UART0_RX_PIN                GPIO_PIN_3
 #define UART0_TX_PORT               GPIOA
 #define UART0_TX_PIN                GPIO_PIN_2
 
 
-/* --- UART1 (Debug/Trace) --- */
-/* Note: UART pins are configured via CubeMX (.ioc). Defined here for context only. */
-#define UART1_RX_PORT               GPIOA
-#define UART1_RX_PIN                GPIO_PIN_10
-#define UART1_TX_PORT               GPIOA
-#define UART1_TX_PIN                GPIO_PIN_9
-
 /* --- Relay Feedback Measurement-Circuit Enable (repurposed I2C1 pins) --- */
-/* K1/K4 relay feedback (RELAY_STATE_1/4) needs its sense circuit actively
- * powered before the reading is valid -- these were I2C1_SCL/SDA (also
- * labelled UART1_TX/RX above; neither peripheral is actually instantiated
- * in this build, see usart.c/i2c.c), now freed up since the temperature
- * sensor was never implemented. I2C1 is disabled (main.c) so these two
- * pins can drive the measurement-circuit enable lines instead. */
+/* K1/K4 relay feedback (RELAY_STATE_1/4) is only valid while its sense
+ * circuit is powered (Board_Enable_Relay_Measurement()). On this board the
+ * enable line is PA9, ex I2C1_SCL -- I2C1 is not initialised (main.c). */
 #define K1_MEAS_ENABLE_PORT         GPIOA
 #define K1_MEAS_ENABLE_PIN          GPIO_PIN_9      /* was I2C1_SCL */
 
@@ -111,13 +100,11 @@
 
 /* --- RCD (Residual Current Device) --- */
 #define RCD_ERROR_PORT              GPIOC
-#define RCD_ERROR_PIN               GPIO_PIN_13     /* Input: Fault signal from RCD module */
-#define RCD_DEBOUNCE_MS             15             /* Software debounce window (ms) */
+#define RCD_ERROR_PIN               GPIO_PIN_13     /* Input: Fault signal from RCD module (open-collector, tripped = LOW) */
+#define RCD_DEBOUNCE_MS             15             /* Line must stay LOW this long, continuously (1 ms samples), to confirm a trip -- see rcd_monitor.c */
 
-#define ADE_EXTI_PORT               GPIOA           /* Input: Interrupt Request (IRQ) */
-#define ADE_EXTI_PIN                GPIO_PIN_1      /* Configured via NVIC in CubeMX */
-
-/* --- Temperature Sensor (I2C, over I2C1_SCL/SDA above) --- */
+/* --- Temperature Sensor alert (LM75B OS output) --- */
+/* For the LM75B temperature sensor driver, which is not part of this build. */
 #define TEMP_SENSOR_ALERT_PORT      GPIOD
 #define TEMP_SENSOR_ALERT_PIN       GPIO_PIN_1      /* Input: alert/interrupt line from the I2C temperature sensor */
 
@@ -130,11 +117,12 @@
 /* POWER CONTROL                                    */
 /* ============================================================================== */
 
-/* --- RELAY COMMANDS (Outputs) --- */
-/* Control signals for high-voltage contactors or PCB relays */
-
+/* --- RELAY COMMANDS (Output) --- */
+/* PC7 / TIM3_CH2: relay-coil MOSFET shared by all contactors, PWM economizer
+ * (pull-in, then hold duty) -- driven through TIM3->CCR2 in board_io.c.
+ * Configured via CubeMX (.ioc). Defined here for context only. */
 #define RELAYS_PORT 				GPIOC
-#define RELAYS_PIN  				GPIO_PIN_7      /* Contactor K3 Command (Phase 3) */
+#define RELAYS_PIN  				GPIO_PIN_7
 
 
 /* --- RELAY FEEDBACK (Inputs) --- */

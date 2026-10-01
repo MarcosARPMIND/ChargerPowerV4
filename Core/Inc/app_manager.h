@@ -11,6 +11,7 @@
 #include "cp.h"
 #include "board_io.h"
 #include "energy_meter.h"
+#include "rcd_monitor.h"
 #include "feature_config.h"
 #include "stm32c0xx_hal.h"
 #include <stdbool.h>
@@ -54,7 +55,27 @@
 // --- Faults & Diagnostics ---
 #define CMD_GET_FAULTS      0x50  // List active faults
 #define CMD_CLEAR_FAULTS    0x51  // Clear faults
-#define CMD_GET_DIAG        0x52  // General diagnostics (FW version, uptime, etc.)
+#define CMD_GET_DIAG        0x52  // Uptime + RS485 link health (see payload below)
+
+/* CMD_GET_DIAG response payload (10 bytes, multi-byte fields MSB first):
+ *   [0]    CMD_ACK
+ *   [1..4] Uptime since the last MCU reset, seconds (a drop = the MCU rebooted)
+ *   [5..6] UART receive errors since boot (each one aborted the DMA reception)
+ *   [7..8] DMA reception restarts since boot (the link recovering by itself)
+ *   [9]    Stuck transmissions force-aborted since boot (saturates at 255) */
+#define CMD_GET_RCD_DIAG    0x53  // RCD line history since boot (see payload below)
+
+/* CMD_GET_RCD_DIAG response payload (10 bytes, multi-byte fields MSB first):
+ *   [0]    CMD_ACK
+ *   [1..2] LOW width of the last confirmed trip, ms (still growing if ONGOING)
+ *   [3]    Flags, RCD_DIAG_FLAG_*
+ *   [4..5] LOW pulses rejected since boot (shorter than RCD_DEBOUNCE_MS, or blanked)
+ *   [6]    Longest rejected pulse, ms (saturates at 255)
+ *   [7..8] Line-1 current when the last trip was handled, 0.1 A (as CMD_GET_CURRENT)
+ *   [9]    STATE_MACHINE state when the last trip was handled
+ * Counters run since boot; CMD_CLEAR_FAULTS does not reset them. */
+#define RCD_DIAG_FLAG_ONGOING    (1U << 0)  /* Last trip's pulse is still LOW: [1..2] = time elapsed so far */
+#define RCD_DIAG_FLAG_RECORDED   (1U << 1)  /* At least one trip since boot: [1..2] and [7..9] are valid */
 
 // --- Hardware Actuation ---
 #define CMD_RELAY_SET       0x60  // Set contactor / relay state
@@ -97,7 +118,7 @@
 #define FAULT_BIT_CABLE      (1U << 7)  /* Bit 7: PP cable coding resistor invalid/unreadable */
 
 
-#define DATA_RS485			10	  // Maximum data lenght for transmisson
+#define DATA_RS485			10	  // Maximum payload length per frame (bytes)
 
 #define CURRENT_LIMIT_HIGH 	33    //Amps
 #define CURRENT_LIMIT_LOW  	6     //Amps
@@ -198,7 +219,7 @@ typedef struct{
 	uint8_t dest_ID;
 	uint8_t cmd;
 	uint8_t len;
-	uint8_t data_RX[DATA_RS485]; //adjust lenght
+	uint8_t data_RX[DATA_RS485]; // payload: received data, or data to send
 }RS485_Frame_t;
 
 /**
@@ -226,8 +247,6 @@ void APP_MAIN(STATE_MACHINE *currentState);
 /* Relay Verification */
 bool APP_Verify_Relays_Closed(DeviceStatus_t *status);
 bool APP_Verify_Relays_Open(DeviceStatus_t *status);
-
-void APP_TEST_Contactor_Monitor(void);
 
 
 #endif /* INC_APP_MANAGER_H_ */

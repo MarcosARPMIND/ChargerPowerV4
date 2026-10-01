@@ -28,19 +28,22 @@
 #define WINDOW_SIZE       (1 << WINDOW_SIZE_SHIFT)
 
 
-#define VRMS_LSB_FP16_device3  2427u  // Q16.16 fixed-point //device3
+/* --- Calibration factors, one per ADE7953 (device1 = line 1) ---
+ * VRMS / IRMS: Q16.16 multipliers (result = raw * factor >> 16), in mV / mA.
+ * POWER:       plain multiplier (result = raw * factor), in mW.
+ * 65536u marks a channel that is NOT calibrated yet (unity Q16.16 scale, or
+ * a placeholder for power) -- its readings are not meaningful. */
+#define VRMS_LSB_FP16_device3  2427u
 #define VRMS_LSB_FP16_device2  2427u
 #define VRMS_LSB_FP16_device1  2427u
 
-#define IRMS_LSB_mA_device3     65536u   // mA por LSB
-#define IRMS_LSB_mA_device2     65536u   // mA por LSB
-//#define IRMS_LSB_mA_device1     65536u   // mA por LSB
-#define IRMS_LSB_mA_device1     874u
+#define IRMS_LSB_mA_device3     65536u   // not calibrated
+#define IRMS_LSB_mA_device2     65536u   // not calibrated
+#define IRMS_LSB_mA_device1     874u     // calibrated against a clamp meter (~9 A)
 
-
-#define POWER_LSB_mW_device3    65536u   // mW por LSB
-#define POWER_LSB_mW_device2    65536u   // mW por LSB
-#define POWER_LSB_mW_device1    65536u   // mW por LSB
+#define POWER_LSB_mW_device3    65536u   // not calibrated
+#define POWER_LSB_mW_device2    65536u   // not calibrated
+#define POWER_LSB_mW_device1    65536u   // not calibrated
 
 /* =================================================================================
  * REGISTER MAP
@@ -137,7 +140,7 @@ typedef struct {
     uint32_t buffer[WINDOW_SIZE];
     uint32_t sum;
     uint8_t  index;
-    uint8_t  count; // Controla o início (antes da janela estar cheia)
+    uint8_t  count; // 0 until the first sample seeds the whole window
 } SlidingWindow_t;
 
 /* =================================================================================

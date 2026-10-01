@@ -49,7 +49,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define WORK_BUFFER_SIZE 256
+/* TIM17 ticks every 100 ms: voltage/current every tick, power/frequency every 10 s */
+#define ENERGY_READ_EVERY_TICKS     100u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,67 +61,11 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile uint8_t timer_seconds = 0;
-
-extern volatile uint8_t RCD_Fault;
-
-/* RCD Debounce Variables (non-static: shared with ISR in stm32c0xx_it.c) */
-volatile uint32_t rcd_trigger_time  = 0;
-volatile bool     rcd_pending_check = false;
-
-/* RCD Blanking Window (non-static: set from app_manager.c's relay
- * verification routines). Bench testing found the RCD module's fault
- * pulse can start with some latency relative to the K1/K4 sense-circuit
- * activation edge -- and lasts ~60ms -- so clearing RCD_Fault/rcd_pending_check
- * only once, right when the verification window closes, isn't reliable:
- * the pulse can still be in flight, or hasn't even started yet, at that
- * exact instant. This timestamp instead suppresses *any* confirmation
- * (see the debounce block below) until well after it, regardless of when
- * exactly within the window the pulse actually occurs. */
-volatile uint32_t rcd_blank_until_tick = 0;
-
+/* Persistent charger state, owned here and advanced by APP_MAIN() */
 STATE_MACHINE currentState = IDLE;
 
-
-
-/* --- PC7 / TIM3_CH2 — relay-coil MOSFET economizer test ---
- * Edit this value live in the debugger (Watch: right-click -> Set Value,
- * or Debug Console: -exec set var test_mosfet_duty_permille = 300) to see
- * the effect on the relay/MOSFET without recompiling.
- * Range: 0-1000 (0.0% - 100.0%). Shares TIM3's 1 kHz base with the CP
- * signal on CH3 -- only the duty is independent, not the frequency.
- */
-
-/* Cable lock actuator feedback — volatile so it survives -Og and can be
- * watched with Live Watch/Live Expressions without halting at a breakpoint
- * (a breakpoint stops the whole CPU, so the H-bridge would stop moving too). */
-volatile ACTUATOR_STATE actuator_state = OPEN;
-
-#if ENABLE_PP_SENSE
-/* Proximity Pilot (PP) line voltage, PA11/ADC1_IN11 -- see PP_Read_mV() in cp.c */
-volatile uint16_t test_pp_mV = 0;
-volatile uint8_t  test_pp_amps = 0;   /* 13/20/32/63, or 0 if no cable/unknown */
-#endif /* ENABLE_PP_SENSE */
-
-/* --- Relay feedback diagnostic (temporary) ---
- * Reads K1-K4 mirror contacts BEFORE commanding the relays, then again once
- * closed, then again once re-opened -- to isolate whether any relay
- * (K4 in particular) reads closed when it shouldn't (wiring/pull config on
- * RELAY_STATE_x). Runs once at boot, before the main loop. Inspect in the
- * debugger (Watch / Live Expressions). Remove once the wiring is confirmed.
- */
-volatile bool diag_k1_before, diag_k2_before, diag_k3_before, diag_k4_before;
-volatile bool diag_k1_closed, diag_k2_closed, diag_k3_closed, diag_k4_closed;
-volatile bool diag_k1_after,  diag_k2_after,  diag_k3_after,  diag_k4_after;
-
-/* TEMP: same "closed" read as diag_k1/k4_closed above, but taken ~2s later
- * instead of ~250ms after commanding the relay closed -- isolates whether
- * the K1/K4 measurement circuit just needs longer than expected to settle
- * (if these read true while diag_k1/k4_closed above read false, it's a
- * timing issue, not a wiring/logic one). Remove once settling time is
- * confirmed and RELAY_MEAS_ENABLE_SETTLING_MS is set accordingly. */
-volatile bool diag_k1_closed_slow, diag_k4_closed_slow;
-
+/* TIM17 ticks since the last energy read (see HAL_TIM_PeriodElapsedCallback) */
+static volatile uint8_t tim17_ticks = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -173,10 +118,9 @@ int main(void){
   MX_TIM14_Init();
   MX_TIM17_Init();
   MX_IWDG_Init(); /* ~8.2s timeout (Prescaler/64, Reload 4095, LSI~32kHz) -- see iwdg.c */
-  /* I2C1 disabled: PA9/PA10 (SCL/SDA) are now the K1/K4 relay
-   * measurement-circuit enable lines -- see K1/K4_MEAS_ENABLE_PIN in
-   * app_config.h. The temperature sensor this bus was reserved for was
-   * never implemented. */
+  /* I2C1 not initialised: on this board PA9 (ex SCL) enables the K1/K4 relay
+   * measurement circuit and PA10 (ex SDA) is the K2 weld-detector test input
+   * -- see K1_MEAS_ENABLE_PIN / K2_WELD_TEST_PIN in app_config.h. */
   //MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
@@ -211,56 +155,12 @@ int main(void){
   ade7953_enable_reset_on_read(ADE_DEVICE_2);
   ade7953_enable_reset_on_read(ADE_DEVICE_3);
 
-
-
-  
-
-
-  /* Clear transient EXTI triggers that occur during power-on */
-  RCD_Fault = 0;
-  rcd_pending_check = false;
-  __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
+  /* Start RCD trip confirmation only now: anything on the line during
+   * power-on is ignored. A line still LOW at this point is not -- see
+   * RCD_Monitor_Arm(). */
+  RCD_Monitor_Arm();
 
   CP_SetLine_High();
-
-  /* --- Relay feedback diagnostic (temporary) ---
-   * K1/K4 sense circuits need Board_Enable_Relay_Measurement(CMD_ACTIVATE)
-   * before their reading means anything (see board_io.c) -- enabled once
-   * for this whole one-shot boot sequence, disabled again at the end. */
-
-  // Board_Enable_Relay_Measurement(CMD_ACTIVATE);
-  // HAL_Delay(RELAY_MEAS_ENABLE_SETTLING_MS);
-
-  // Board_Set_Contactors(CMD_DEACTIVATE);   /* baseline: force open first */
-  // HAL_Delay(100);
-  // diag_k1_before = Board_Is_K1_Closed();
-  // diag_k2_before = Board_Is_K2_Closed();
-  // diag_k3_before = Board_Is_K3_Closed();
-  // diag_k4_before = Board_Is_K4_Closed();
-
-  // Board_Set_Contactors(CMD_ACTIVATE);     /* pull-in 150ms -> 30% hold, see board_io.c */
-  // HAL_Delay(100);                          /* extra settling beyond the pull-in/hold above */
-  // diag_k1_closed = Board_Is_K1_Closed();
-  // diag_k2_closed = Board_Is_K2_Closed();
-  // diag_k3_closed = Board_Is_K3_Closed();
-  // diag_k4_closed = Board_Is_K4_Closed();
-
-
-  // Board_Enable_Relay_Measurement(CMD_DEACTIVATE);
-
-  // diag_k1_closed = Board_Is_K1_Closed();
-  // diag_k2_closed = Board_Is_K2_Closed();
-  // diag_k3_closed = Board_Is_K3_Closed();
-  // diag_k4_closed = Board_Is_K4_Closed();
-
-  // Board_Set_Contactors(CMD_DEACTIVATE); 
-
-  // diag_k1_closed = Board_Is_K1_Closed();
-  // diag_k2_closed = Board_Is_K2_Closed();
-  // diag_k3_closed = Board_Is_K3_Closed();
-  // diag_k4_closed = Board_Is_K4_Closed();
-
-
 
   /* USER CODE END 2 */
 
@@ -268,60 +168,24 @@ int main(void){
   /* USER CODE BEGIN WHILE */
 
   /* -----------------------------------------------------------
-   * MAIN APPLICATION LOOP
+   * MAIN APPLICATION LOOP -- task-based cyclic executive
+   * 1. Comms task:    RS485 intake, command dispatch, notify retries.
+   * 2. State machine: EVSE logic (CP signalling, contactors, cable lock),
+   *                   including the safety overrides (RCD, grid faults).
+   * 3. Energy task:   ADE7953 readings, gated by the TIM17 flags.
    *
-   * Architecture: Task-Based Cyclic Executive
-   * 1. Comms Task: Handles RS485/UART data intake and command dispatching.
-   * 2. State Machine: Manages EVSE logic (CP signaling, Contactor control).
-   * 3. Background Tasks: Energy metering, Safety monitoring.
-   *
-   *
+   * RCD trips are confirmed asynchronously by rcd_monitor.c (SysTick ISR)
+   * and acted upon by APP_MAIN() with top priority over any state.
    * ----------------------------------------------------------- */
-
-
-
   while (1)
   {
-
-
-      // 0. RCD Debounce Validation
-#if RCD_BLANK_DURING_RELAY_VERIFICATION
-      if (rcd_pending_check && HAL_GetTick() < rcd_blank_until_tick) {
-          /* Still inside a relay-verification blanking window (see
-           * rcd_blank_until_tick) -- this edge is attributable to the K1/K4
-           * sense-circuit activation, not a real residual-current event. */
-          rcd_pending_check = false;
-      }
-#endif
-      if (rcd_pending_check) {
-          if ((HAL_GetTick() - rcd_trigger_time) >= RCD_DEBOUNCE_MS) {
-              /* Debounce window elapsed — re-read the physical pin.
-               * RCD module output is open-collector: idle/OK = pulled HIGH,
-               * tripped = pulled LOW (0V). */
-              if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) {
-                  /* Pin still LOW after RCD_DEBOUNCE_MS → confirmed real RCD fault */
-                  RCD_Fault = 1;
-              }
-              rcd_pending_check = false;
-          }
-      }
-
-      /* RCD_Fault (once confirmed above) is handled inside APP_MAIN() itself,
-       * with top priority over any state -- it opens the contactors, unlocks
-       * the cable once relays are confirmed open, and transitions to
-       * FAULT_RCD. No need to react to it here too. */
-
-
       HAL_Delay(5);
 
-      // --- Normal operation (disabled during bring-up test) ---
-       APP_Comms_Task();
-       APP_MAIN(&currentState);
-       APP_Energy_Task();
+      APP_Comms_Task();
+      APP_MAIN(&currentState);
+      APP_Energy_Task();
 
       HAL_IWDG_Refresh(&hiwdg);
-
-
   }
 
     /* USER CODE END WHILE */
@@ -372,29 +236,19 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 /**
- * @brief  EXTI Callback — RCD Fault Trigger (Debounced)
- * @note   Only records the timestamp of the trigger. Actual fault confirmation
- *         happens in the main loop after RCD_DEBOUNCE_MS has elapsed and the
- *         pin is re-read to filter out EMI noise spikes.
+ * @brief  Timer period-elapsed callback -- paces APP_Energy_Task().
+ * @note   TIM17 fires every 100 ms: Vrms/Irms are refreshed on every tick
+ *         (fast enough for the grid/overcurrent checks in APP_MAIN()), active
+ *         power and line frequency every ENERGY_READ_EVERY_TICKS (10 s).
  */
-/*
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == GPIO_PIN_13) {
-    	RCD_Fault = 1;
-    }
-}
-*/
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     if (htim->Instance == TIM17) {
-        // Esta flag dispara a cada 1 segundo (útil para RMS rápido/Proteção)
     	APP_Voltage_Flag_Set();
 
-        timer_seconds++;
-        if (timer_seconds >= 100) {
-            timer_seconds = 0;
-            // Esta flag dispara a cada 10 segundos (para Energia)
+        tim17_ticks++;
+        if (tim17_ticks >= ENERGY_READ_EVERY_TICKS) {
+            tim17_ticks = 0;
             APP_Energy_Flag_Set();
         }
     }

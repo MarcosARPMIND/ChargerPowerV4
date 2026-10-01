@@ -227,20 +227,6 @@ CP_State CP_GetState(void)
 
 #if ENABLE_PP_SENSE
 
-/* Debug mirror of PP_Read_mV()'s internals -- inspect in the debugger
- * (Watch / Live Expressions) when test_pp_mV (main.c) stays at 0, to see
- * exactly which step failed: a bad HAL status on either ConfigChannel call,
- * Start, or a PollForConversion timeout all leave the mV reading at 0 the
- * same way a genuine 0V on PA11 would, but mean very different things.
- * Remove once PP sensing is confirmed working against real hardware. */
-volatile HAL_StatusTypeDef debug_pp_stopdma_status = HAL_ERROR; /* Stop_DMA before reconfiguring */
-volatile uint8_t           debug_pp_stopdma_retries = 0;       /* attempts needed to actually stop */
-volatile HAL_StatusTypeDef debug_pp_cfg0_status   = HAL_ERROR; /* ConfigChannel: remove ch0 */
-volatile HAL_StatusTypeDef debug_pp_cfg11_status  = HAL_ERROR; /* ConfigChannel: add ch11 */
-volatile HAL_StatusTypeDef debug_pp_start_status  = HAL_ERROR;
-volatile HAL_StatusTypeDef debug_pp_poll_status   = HAL_ERROR;
-volatile uint16_t          debug_pp_raw           = 0;         /* raw 12-bit ADC value, pre-mV conversion */
-
 /** Max attempts to stop the CP's continuous conversion before giving up.
  * HAL's own internal wait per attempt is ADC_STOP_CONVERSION_TIMEOUT (2ms,
  * stm32c0xx_hal_adc.c) -- too tight for ADSTART to reliably clear in one
@@ -260,13 +246,12 @@ uint16_t PP_Read_mV(void)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
     uint16_t raw = 0;
+    uint8_t  retries = 0;
 
-    debug_pp_stopdma_retries = 0;
-    debug_pp_stopdma_status = HAL_ADC_Stop_DMA(&hadc1);
-    while (debug_pp_stopdma_status != HAL_OK && debug_pp_stopdma_retries < PP_STOP_DMA_MAX_RETRIES)
+    /* Stop the CP's continuous DMA scan (retried, see PP_STOP_DMA_MAX_RETRIES) */
+    while (HAL_ADC_Stop_DMA(&hadc1) != HAL_OK && retries < PP_STOP_DMA_MAX_RETRIES)
     {
-        debug_pp_stopdma_retries++;
-        debug_pp_stopdma_status = HAL_ADC_Stop_DMA(&hadc1);
+        retries++;
     }
 
     /* This ADC ORs each configured channel into CHSELR instead of replacing
@@ -275,19 +260,17 @@ uint16_t PP_Read_mV(void)
      * first, ahead of Channel 11, on every trigger. */
     sConfig.Channel = ADC_CHANNEL_0;
     sConfig.Rank    = ADC_RANK_NONE;
-    debug_pp_cfg0_status = HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
     sConfig.Channel = ADC_CHANNEL_11;
     sConfig.Rank    = ADC_RANK_CHANNEL_NUMBER;
-    debug_pp_cfg11_status = HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
-    debug_pp_start_status = HAL_ADC_Start(&hadc1);
-    debug_pp_poll_status = HAL_ADC_PollForConversion(&hadc1, 10);
-    if (debug_pp_poll_status == HAL_OK)
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
     {
         raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
     }
-    debug_pp_raw = raw;
     HAL_ADC_Stop(&hadc1);
 
     /* Restore: remove Channel 11, re-enable Channel 0, resume the CP's DMA scan */

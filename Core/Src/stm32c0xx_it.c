@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdbool.h>
+#include "rcd_monitor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,8 +63,7 @@ extern DMA_HandleTypeDef hdma_usart2_rx;
 extern DMA_HandleTypeDef hdma_usart2_tx;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
-extern volatile uint32_t rcd_trigger_time;
-extern volatile bool rcd_pending_check;
+
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -135,7 +135,7 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
-
+  RCD_Monitor_Tick_1ms();   /* RCD line: 1 ms sampling + continuous-LOW confirmation */
   /* USER CODE END SysTick_IRQn 1 */
 }
 
@@ -152,19 +152,9 @@ void SysTick_Handler(void)
 void EXTI4_15_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI4_15_IRQn 0 */
-
-  if ( (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_13) != 0x00u) )
-  {
-      __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_13);
-
-      /* Debounce: only record the trigger, don't set fault yet.
-       * Main loop will confirm after RCD_DEBOUNCE_MS. */
-      if (!rcd_pending_check) {
-          rcd_trigger_time  = HAL_GetTick();
-          rcd_pending_check = true;
-      }
-  }
-
+  /* PC13 (RCD) is no longer detected by this edge: it is sampled every 1 ms
+   * from SysTick_Handler instead (rcd_monitor.c). The HAL handler below
+   * just clears the pending flag. */
   /* USER CODE END EXTI4_15_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
   /* USER CODE BEGIN EXTI4_15_IRQn 1 */
