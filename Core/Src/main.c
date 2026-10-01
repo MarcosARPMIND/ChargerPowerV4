@@ -54,12 +54,14 @@
 /* Relay-coil economizer bench test (temporary, see USER CODE 2).
  * 1 = runs once at boot, before the main loop, to tune the RELAY_* limits
  * in board_io.h. Keep at 0 in anything pushed/flashed for normal use.
- * Needs mains on the relays' line side (the K1 feedback optocoupler only
- * sees a closed contact with AC across it) and NO vehicle connected: the
- * output is live every time the relays close. */
+ * The relay feedback is NOT read: you watch the relay itself (release
+ * click, or contact continuity with a multimeter) while the debugger prints
+ * each step. NO vehicle connected: the output is live whenever the relays
+ * close with mains on the line side. */
 #define RELAY_COIL_TEST              0
 #define RELAY_TEST_STEP_PERMILLE     10      /* Hold sweep step: 1.0% duty */
-#define RELAY_TEST_DWELL_MS          1000    /* Per step: coil settling + optocoupler charge/discharge (100-200 ms) */
+#define RELAY_TEST_HOLD_MIN_PERMILLE 20      /* Hold sweep stops at 2.0% */
+#define RELAY_TEST_DWELL_MS          2000    /* Per step: time to notice the click and read the step */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -114,13 +116,10 @@ volatile bool diag_k1_closed, diag_k2_closed, diag_k3_closed, diag_k4_closed;
 volatile bool diag_k1_after,  diag_k2_after,  diag_k3_after,  diag_k4_after;
 
 #if RELAY_COIL_TEST
-/* Economizer bench test results -- read in the debugger once test_relay_status != 0 */
-volatile uint8_t  test_relay_status        = 0;  /* 0 running, 1 done, 2 K1 never closed even at 100% (mains on line side?),
-                                                    3 K1 still reads closed with the coil off (welded / feedback stuck) */
-volatile uint16_t test_relay_duty_now      = 0;  /* Coil duty currently applied (live progress) */
-volatile uint16_t test_relay_min_hold      = 0;  /* Lowest hold duty at which K1 stayed closed */
-volatile uint16_t test_relay_dropout       = 0;  /* First duty at which K1 opened (0 = held all the way down) */
-volatile uint16_t test_relay_min_pullin_ms = 0;  /* Shortest 100% pulse that closed K1 and held at RELAY_HOLD_DUTY_PERMILLE (0 = none) */
+/* Economizer bench test progress -- printed live by the GDB dprintf on
+ * Board_Set_Relay_Coil_Duty() (see the test in USER CODE 2) */
+volatile uint8_t  test_relay_phase     = 0;  /* 1 hold sweep, 2 pull-in sweep, 3 done */
+volatile uint16_t test_relay_pullin_ms = 0;  /* Pull-in pulse being tried (phase 2), ms */
 #endif /* RELAY_COIL_TEST */
 
 /* USER CODE END PV */
@@ -217,64 +216,43 @@ int main(void)
 
 #if RELAY_COIL_TEST
   /* --- Relay-coil economizer bench test (temporary) ---
-   * A) Hold sweep: close at 100%, then lower the hold duty in steps from
-   *    RELAY_HOLD_DUTY_PERMILLE until K1 drops out.
-   * B) Pull-in sweep: shortest 100% pulse that still closes K1 before
-   *    dropping to RELAY_HOLD_DUTY_PERMILLE.
+   * No feedback is read: watch the relay while GDB prints each step.
+   * 1) Hold sweep: pull in at 100% for RELAY_PULLIN_TIME_MS, then lower the
+   *    hold duty from RELAY_HOLD_DUTY_PERMILLE down to
+   *    RELAY_TEST_HOLD_MIN_PERMILLE, RELAY_TEST_DWELL_MS per step. The step
+   *    at which the relay releases (click / continuity lost) is the
+   *    drop-out duty.
+   * 2) Pull-in sweep: from fully open, 100% pulses of increasing length,
+   *    each followed by RELAY_HOLD_DUTY_PERMILLE. The shortest pulse after
+   *    which the relay closes and stays closed is the minimum pull-in time.
    * Runs before the RCD/EXTI clear below, so relay-switching EMI picked up
    * by the RCD line during the test is discarded there. */
   {
     static const uint16_t pullin_ms[] = { 10, 20, 30, 50, 75, 100, 150 };
-    uint16_t duty;
 
-    /* A) Full duty for the whole dwell: tells "no feedback at all" apart
-     *    from "hold too weak" before the sweep starts. */
-    test_relay_duty_now = RELAY_PULLIN_DUTY_PERMILLE;
+    /* 1) Hold sweep */
+    test_relay_phase = 1;
     Board_Set_Relay_Coil_Duty(RELAY_PULLIN_DUTY_PERMILLE);
-    HAL_Delay(RELAY_TEST_DWELL_MS);
-
-    if (!Board_Is_K1_Closed()) {
-      test_relay_status = 2;
-    } else {
-      for (duty = RELAY_HOLD_DUTY_PERMILLE; duty >= RELAY_TEST_STEP_PERMILLE; duty -= RELAY_TEST_STEP_PERMILLE) {
-        test_relay_duty_now = duty;
-        Board_Set_Relay_Coil_Duty(duty);
-        HAL_Delay(RELAY_TEST_DWELL_MS);
-        if (!Board_Is_K1_Closed()) {
-          test_relay_dropout = duty;
-          break;
-        }
-        test_relay_min_hold = duty;
-      }
+    HAL_Delay(RELAY_PULLIN_TIME_MS);
+    for (uint16_t duty = RELAY_HOLD_DUTY_PERMILLE; duty >= RELAY_TEST_HOLD_MIN_PERMILLE; duty -= RELAY_TEST_STEP_PERMILLE) {
+      Board_Set_Relay_Coil_Duty(duty);
+      HAL_Delay(RELAY_TEST_DWELL_MS);
     }
 
-    /* B) Each attempt starts fully open, with the optocoupler discharged */
-    for (uint8_t i = 0; test_relay_status == 0 && i < sizeof(pullin_ms) / sizeof(pullin_ms[0]); i++) {
-      test_relay_duty_now = 0;
+    /* 2) Pull-in sweep, every attempt starting fully open */
+    test_relay_phase = 2;
+    for (uint8_t i = 0; i < sizeof(pullin_ms) / sizeof(pullin_ms[0]); i++) {
+      test_relay_pullin_ms = pullin_ms[i];
       Board_Set_Relay_Coil_Duty(0);
       HAL_Delay(RELAY_TEST_DWELL_MS);
-      if (Board_Is_K1_Closed()) {
-        test_relay_status = 3;
-        break;
-      }
-
-      test_relay_duty_now = RELAY_PULLIN_DUTY_PERMILLE;
       Board_Set_Relay_Coil_Duty(RELAY_PULLIN_DUTY_PERMILLE);
       HAL_Delay(pullin_ms[i]);
-      test_relay_duty_now = RELAY_HOLD_DUTY_PERMILLE;
       Board_Set_Relay_Coil_Duty(RELAY_HOLD_DUTY_PERMILLE);
       HAL_Delay(RELAY_TEST_DWELL_MS);
-      if (Board_Is_K1_Closed()) {
-        test_relay_min_pullin_ms = pullin_ms[i];
-        break;
-      }
     }
 
-    test_relay_duty_now = 0;
     Board_Set_Relay_Coil_Duty(0);    /* never leave the relays energized */
-    if (test_relay_status == 0) {
-      test_relay_status = 1;
-    }
+    test_relay_phase = 3;
   }
 #endif /* RELAY_COIL_TEST */
 
